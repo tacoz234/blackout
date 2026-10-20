@@ -205,6 +205,33 @@ enum Hotkey {
     }
 }
 
+// A per-user LaunchAgent that opens Blackout into the menu bar (without blacking out) at login.
+// Used instead of SMAppService because it works on macOS 12 and can pass --background.
+enum LoginItem {
+    private static let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/LaunchAgents/local.blackout.login.plist")
+
+    static var isEnabled: Bool { FileManager.default.fileExists(atPath: url.path) }
+
+    static func set(_ enabled: Bool) {
+        guard enabled else { try? FileManager.default.removeItem(at: url); return }
+        guard let exe = Bundle.main.executablePath else { return }
+        let plist: [String: Any] = [
+            "Label": "local.blackout.login",
+            "ProgramArguments": [exe, "--background"],
+            "RunAtLoad": true,
+            "LimitLoadToSessionType": "Aqua",
+        ]
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+            try? data.write(to: url)
+        }
+    }
+
+    // Keeps the agent pointing at this copy of the app if it was moved or reinstalled.
+    static func refresh() { if isEnabled { set(true) } }
+}
+
 // NSMenuItem that runs a closure.
 final class ActionItem: NSMenuItem {
     private let handler: () -> Void
@@ -228,6 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         Settings.register()
+        LoginItem.refresh()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         let image = NSImage(systemSymbolName: "moon.fill", accessibilityDescription: "Blackout")
@@ -322,6 +350,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
         menu.addItem(ActionItem("End Blackout When Mac Locks", checked: Settings.endOnLock) {
             Settings.endOnLock.toggle()
+        })
+        menu.addItem(ActionItem("Open at Login", checked: LoginItem.isEnabled) {
+            LoginItem.set(!LoginItem.isEnabled)
         })
         menu.addItem(.separator())
         menu.addItem(ActionItem("Quit Blackout") { NSApp.terminate(nil) })

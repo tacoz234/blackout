@@ -63,6 +63,30 @@ static class Settings
     static string B(bool b) { return b ? "1" : "0"; }
 }
 
+// Per-user Run key entry that launches Blackout into the tray (without blacking out) at sign-in.
+static class StartWithWindows
+{
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    static string Command { get { return "\"" + Application.ExecutablePath + "\" --background"; } }
+
+    public static bool IsEnabled
+    {
+        get { using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue("Blackout") != null; }
+    }
+
+    public static void Set(bool enabled)
+    {
+        using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+        {
+            if (enabled) k.SetValue("Blackout", Command);
+            else k.DeleteValue("Blackout", false);
+        }
+    }
+
+    // Keeps the entry pointing at this exe if it was moved or reinstalled.
+    public static void Refresh() { if (IsEnabled) Set(true); }
+}
+
 sealed class BlackForm : Form
 {
     const int Gray = 153;
@@ -318,6 +342,8 @@ sealed class Controller : ApplicationContext
         items.Add(Option("Exit on mouse move or any key", Settings.ExitOnInput, v => Settings.ExitOnInput = v));
         items.Add(Option("Show clock on mouse move", Settings.ClockOnMove, v => Settings.ClockOnMove = v));
         items.Add(Option("End blackout when PC locks", Settings.EndOnLock, v => Settings.EndOnLock = v));
+        items.Add(new ToolStripMenuItem("Start with Windows", null, (s, e) => StartWithWindows.Set(!StartWithWindows.IsEnabled))
+            { Checked = StartWithWindows.IsEnabled });
         items.Add(new ToolStripSeparator());
         items.Add(new ToolStripMenuItem("Quit Blackout", null, (s, e) => Quit()));
     }
@@ -389,6 +415,7 @@ static class Program
         Application.EnableVisualStyles();
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
         Settings.Load();
+        StartWithWindows.Refresh();
         var controller = new Controller();
         var ui = SynchronizationContext.Current;
         ThreadPool.RegisterWaitForSingleObject(activate, (state, timedOut) => ui.Post(delegate { controller.Start(); }, null), null, -1, false);

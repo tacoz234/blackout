@@ -23,6 +23,7 @@ All saved between launches:
 - **Exit on mouse move or any key** — screensaver-style.
 - **Show clock on mouse move** — briefly shows the time on the screen under the cursor, then fades back to black.
 - **End blackout when the computer locks** *(on by default)*.
+- **Start at login** — launches into the tray/menu bar at sign-in without blacking out.
 
 ## Download
 
