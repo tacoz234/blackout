@@ -258,9 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         LoginItem.refresh()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        let image = NSImage(systemSymbolName: "moon.fill", accessibilityDescription: "Blackout")
-        image?.isTemplate = true
-        statusItem.button?.image = image
+        statusItem.button?.image = Self.menuBarIcon()
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -279,6 +277,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if !CommandLine.arguments.contains("--background") { blackout.start() }
+    }
+
+    // White-outlined black rounded square (matches the Windows tray icon), visible on light and dark menu bars.
+    static func menuBarIcon() -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            let path = NSBezierPath(roundedRect: NSRect(x: 2, y: 2, width: 14, height: 14), xRadius: 3.5, yRadius: 3.5)
+            path.lineWidth = 1.5
+            NSColor.black.setFill()
+            path.fill()
+            NSColor.white.setStroke()
+            path.stroke()
+            return true
+        }
+        image.accessibilityDescription = "Blackout"
+        return image
     }
 
     // Opening the app again while it's running blacks out again.
