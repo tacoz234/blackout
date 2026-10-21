@@ -1,8 +1,9 @@
 # Builds Blackout.exe using the C# compiler that ships with Windows (.NET Framework 4.x).
 #   -Version 1.2.3   stamp a version (default 0.0.0-dev)
 #   -Package         also write dist\Blackout-<version>-windows.zip
+#   -Installer       also write dist\Blackout-<version>-windows-setup.exe (needs Inno Setup 6)
 #   -Install         copy to %LOCALAPPDATA%\Programs\Blackout and add a Start Menu shortcut
-param([string]$Version = '0.0.0-dev', [switch]$Package, [switch]$Install)
+param([string]$Version = '0.0.0-dev', [switch]$Package, [switch]$Installer, [switch]$Install)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
@@ -53,6 +54,17 @@ if ($Package) {
     $zip = "$dist\Blackout-$Version-windows.zip"
     Compress-Archive -Path Blackout.exe -DestinationPath $zip -Force
     Write-Host "Packaged $zip"
+}
+
+if ($Installer) {
+    $iscc = @((Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $iscc) { throw "Inno Setup 6 not found (winget install JRSoftware.InnoSetup)" }
+    & $iscc /Q "/DAppVersion=$Version" "/DNumericVersion=$numeric" installer.iss
+    if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
+    Write-Host "Packaged $(Split-Path $PSScriptRoot)\dist\Blackout-$Version-windows-setup.exe"
 }
 
 if ($Install) {

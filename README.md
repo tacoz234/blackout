@@ -27,10 +27,14 @@ All saved between launches:
 
 ## Download
 
-Grab the latest zip for your platform from [Releases](../../releases).
+Get the latest version from [Releases](../../releases). No command line needed.
 
-- **macOS:** unzip and move `Blackout.app` to Applications. Unless the release is notarized, right-click → Open the first time.
-- **Windows:** unzip and run `Blackout.exe`. SmartScreen may warn because it's unsigned — choose *More info → Run anyway*.
+**Windows:** download `Blackout-<version>-windows-setup.exe` and run it. It installs just for you (no admin prompt), adds Blackout to the Start Menu, and can start it when you sign in. Blackout then sits in the system tray; press **Ctrl+Alt+B** or click the tray icon to black out. Uninstall it from *Settings → Apps* like any other app.
+Because the installer isn't code-signed, SmartScreen may say "Windows protected your PC". Click *More info → Run anyway*.
+Prefer no installer? `Blackout-<version>-windows.zip` has the bare `Blackout.exe`.
+
+**macOS:** download `Blackout-<version>-macos.dmg`, open it, and drag Blackout into Applications. Then open it from Launchpad or Spotlight. It lives in the menu bar; press **⌃⌥⌘B** to black out.
+Unless the release is notarized, macOS blocks the first launch. On macOS 15 and later, go to *System Settings → Privacy & Security* and click *Open Anyway*. On older versions, right-click the app and choose *Open*.
 
 ## Build
 
@@ -39,7 +43,7 @@ Grab the latest zip for your platform from [Releases](../../releases).
 ```sh
 macos/build.sh             # builds macos/Blackout.app
 macos/build.sh --install   # also copies it to /Applications
-VERSION=1.2.0 macos/build.sh --package   # writes dist/Blackout-1.2.0-macos.zip
+VERSION=1.2.0 macos/build.sh --package   # writes dist/Blackout-1.2.0-macos.dmg
 ```
 
 Set `SIGN_IDENTITY` to sign with a Developer ID (hardened runtime), and `NOTARY_PROFILE` to notarize when packaging.
@@ -49,7 +53,8 @@ Set `SIGN_IDENTITY` to sign with a Developer ID (hardened runtime), and `NOTARY_
 ```powershell
 powershell -ExecutionPolicy Bypass -File windows\build.ps1             # builds windows\Blackout.exe
 powershell -ExecutionPolicy Bypass -File windows\build.ps1 -Install    # also installs + adds a Start Menu shortcut
-powershell -ExecutionPolicy Bypass -File windows\build.ps1 -Version 1.2.0 -Package   # writes dist\Blackout-1.2.0-windows.zip
+powershell -ExecutionPolicy Bypass -File windows\build.ps1 -Version 1.2.0 -Package     # writes dist\Blackout-1.2.0-windows.zip
+powershell -ExecutionPolicy Bypass -File windows\build.ps1 -Version 1.2.0 -Installer   # writes dist\Blackout-1.2.0-windows-setup.exe (needs Inno Setup 6)
 ```
 
 ## Releases

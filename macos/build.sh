@@ -1,11 +1,11 @@
 #!/bin/sh
 # Builds Blackout.app (universal, macOS 12+).
 #   VERSION=1.2.3 ./build.sh   stamp a version (default 0.0.0-dev)
-#   ./build.sh --package       also write dist/Blackout-<version>-macos.zip
+#   ./build.sh --package       also write dist/Blackout-<version>-macos.dmg
 #   ./build.sh --install       also copy it to /Applications
 # Signing is ad-hoc unless SIGN_IDENTITY="Developer ID Application: ..." is set.
 # With NOTARY_PROFILE set (from `xcrun notarytool store-credentials`), --package also
-# notarizes and staples the app so Gatekeeper opens it without warnings.
+# notarizes and staples the disk image so Gatekeeper opens it without warnings.
 set -e
 cd "$(dirname "$0")"
 VERSION="${VERSION:-0.0.0-dev}"
@@ -34,15 +34,19 @@ echo "Built $(pwd)/$APP ($VERSION)"
 for arg in "$@"; do
   case "$arg" in
     --package)
+      # Drag-to-Applications disk image (the usual way Mac apps are downloaded).
       mkdir -p ../dist
-      ZIP="../dist/Blackout-$VERSION-macos.zip"
-      rm -f "$ZIP" && ditto -c -k --keepParent "$APP" "$ZIP"
+      DMG="../dist/Blackout-$VERSION-macos.dmg"
+      STAGE="$(mktemp -d)"
+      cp -R "$APP" "$STAGE/" && ln -s /Applications "$STAGE/Applications"
+      rm -f "$DMG" && hdiutil create -volname Blackout -srcfolder "$STAGE" -format UDZO -quiet "$DMG"
+      rm -rf "$STAGE"
+      if [ -n "$SIGN_IDENTITY" ]; then codesign --force -s "$SIGN_IDENTITY" "$DMG"; fi
       if [ -n "$NOTARY_PROFILE" ]; then
-        xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
-        xcrun stapler staple "$APP"
-        rm -f "$ZIP" && ditto -c -k --keepParent "$APP" "$ZIP"
+        xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+        xcrun stapler staple "$DMG"
       fi
-      echo "Packaged $ZIP"
+      echo "Packaged $DMG"
       ;;
     --install)
       pkill -x Blackout || true
