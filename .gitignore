@@ -1,3 +1,5 @@
 Blackout.app/
 build/
+dist/
 .DS_Store
+Blackout.exe

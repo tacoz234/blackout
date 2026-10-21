@@ -1,0 +1,427 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+using Microsoft.Win32;
+using Timer = System.Windows.Forms.Timer;
+
+// Pure-black, truly full-screen blackout for OLED displays.
+// Lives in the system tray; Ctrl+Alt+B toggles the blackout, Escape ends it.
+// Note: compiled with the in-box csc.exe, which only supports C# 5.
+
+static class Settings
+{
+    public static bool KeepAwake = true, ExitOnInput = false, ClockOnMove = false, EndOnLock = true, ShownTrayTip = false;
+    public static int TimerMinutes = 0;
+    public static HashSet<string> ExcludedDisplays = new HashSet<string>();
+
+    static readonly string FilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Blackout", "settings.ini");
+
+    public static void Load()
+    {
+        if (!File.Exists(FilePath)) return;
+        foreach (var line in File.ReadAllLines(FilePath))
+        {
+            int i = line.IndexOf('=');
+            if (i < 0) continue;
+            string k = line.Substring(0, i).Trim(), v = line.Substring(i + 1).Trim();
+            switch (k)
+            {
+                case "KeepAwake": KeepAwake = v == "1"; break;
+                case "ExitOnInput": ExitOnInput = v == "1"; break;
+                case "ClockOnMove": ClockOnMove = v == "1"; break;
+                case "EndOnLock": EndOnLock = v == "1"; break;
+                case "ShownTrayTip": ShownTrayTip = v == "1"; break;
+                case "TimerMinutes": int.TryParse(v, out TimerMinutes); break;
+                case "ExcludedDisplays":
+                    ExcludedDisplays = new HashSet<string>(v.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries));
+                    break;
+            }
+        }
+    }
+
+    public static void Save()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(FilePath));
+        File.WriteAllLines(FilePath, new[] {
+            "KeepAwake=" + B(KeepAwake),
+            "ExitOnInput=" + B(ExitOnInput),
+            "ClockOnMove=" + B(ClockOnMove),
+            "EndOnLock=" + B(EndOnLock),
+            "ShownTrayTip=" + B(ShownTrayTip),
+            "TimerMinutes=" + TimerMinutes,
+            "ExcludedDisplays=" + string.Join("|", ExcludedDisplays),
+        });
+    }
+
+    static string B(bool b) { return b ? "1" : "0"; }
+}
+
+// Per-user Run key entry that launches Blackout into the tray (without blacking out) at sign-in.
+static class StartWithWindows
+{
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    static string Command { get { return "\"" + Application.ExecutablePath + "\" --background"; } }
+
+    public static bool IsEnabled
+    {
+        get { using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue("Blackout") != null; }
+    }
+
+    public static void Set(bool enabled)
+    {
+        using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+        {
+            if (enabled) k.SetValue("Blackout", Command);
+            else k.DeleteValue("Blackout", false);
+        }
+    }
+
+    // Keeps the entry pointing at this exe if it was moved or reinstalled.
+    public static void Refresh() { if (IsEnabled) Set(true); }
+}
+
+sealed class BlackForm : Form
+{
+    const int Gray = 153;
+    readonly Controller owner;
+    readonly Label overlay;
+    readonly Timer fadeTimer = new Timer { Interval = 16 };
+    readonly float scale;
+    DateTime fadeAt;
+
+    public BlackForm(Controller owner, Screen screen)
+    {
+        this.owner = owner;
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        Bounds = screen.Bounds;            // full bounds, incl. taskbar area
+        BackColor = Color.Black;
+        TopMost = true;                    // above the taskbar and other windows
+        ShowInTaskbar = false;
+        KeyPreview = true;
+        DoubleBuffered = true;
+        using (var g = CreateGraphics()) scale = g.DpiX / 96f;
+
+        overlay = new Label { AutoSize = true, BackColor = Color.Black, Visible = false };
+        Controls.Add(overlay);
+        fadeTimer.Tick += FadeTick;
+    }
+
+    // Shows centered text, holds it, then fades it to black over 1s. Calling again restarts the hold.
+    public void Flash(string text, string fontName, float px, double holdSeconds)
+    {
+        var font = new Font(fontName, px * scale, FontStyle.Regular, GraphicsUnit.Pixel);
+        if (overlay.Text != text || !overlay.Font.Equals(font)) { overlay.Font = font; overlay.Text = text; }
+        overlay.ForeColor = Color.FromArgb(Gray, Gray, Gray);
+        overlay.Size = overlay.PreferredSize;
+        overlay.Location = new Point((ClientSize.Width - overlay.Width) / 2, (ClientSize.Height - overlay.Height) / 2);
+        overlay.Visible = true;
+        fadeAt = DateTime.Now.AddSeconds(holdSeconds);
+        fadeTimer.Start();
+    }
+
+    void FadeTick(object sender, EventArgs e)
+    {
+        double t = (DateTime.Now - fadeAt).TotalSeconds;
+        if (t >= 1.0) { overlay.Visible = false; fadeTimer.Stop(); return; }
+        if (t > 0) { int v = (int)(Gray * (1 - t)); overlay.ForeColor = Color.FromArgb(v, v, v); }
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.Escape || Settings.ExitOnInput) { owner.RequestStop(); return true; }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (Settings.ExitOnInput) owner.RequestStop();
+        base.OnMouseDown(e);
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // Alt+F4 ends the blackout instead of closing a single screen.
+        if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; owner.RequestStop(); }
+        base.OnFormClosing(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) fadeTimer.Dispose();
+        base.Dispose(disposing);
+    }
+}
+
+// Hidden window that receives the global hotkey.
+sealed class HotkeyWindow : NativeWindow, IDisposable
+{
+    const int WM_HOTKEY = 0x0312, MOD_ALT = 0x1, MOD_CONTROL = 0x2, MOD_NOREPEAT = 0x4000;
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, int mods, int vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    readonly Action onPress;
+    public readonly bool Registered;
+
+    public HotkeyWindow(Action onPress)
+    {
+        this.onPress = onPress;
+        CreateHandle(new CreateParams());
+        Registered = RegisterHotKey(Handle, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, (int)Keys.B);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_HOTKEY) onPress();
+        base.WndProc(ref m);
+    }
+
+    public void Dispose() { UnregisterHotKey(Handle, 1); DestroyHandle(); }
+}
+
+sealed class Controller : ApplicationContext
+{
+    const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x1, ES_DISPLAY_REQUIRED = 0x2;
+    [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+
+    static readonly int[] TimerChoices = { 0, 15, 30, 60, 120, 240 };
+
+    readonly List<BlackForm> forms = new List<BlackForm>();
+    readonly NotifyIcon tray;
+    readonly HotkeyWindow hotkey;
+    readonly Timer poll = new Timer { Interval = 50 };
+    readonly SynchronizationContext ui = SynchronizationContext.Current;
+    bool active, cursorHidden;
+    DateTime startedAt;
+    DateTime? endAt;
+    Point anchor;
+
+    public Controller()
+    {
+        hotkey = new HotkeyWindow(Toggle);
+        tray = new NotifyIcon { Icon = MakeTrayIcon(), Text = "Blackout", Visible = true, ContextMenuStrip = new ContextMenuStrip() };
+        tray.ContextMenuStrip.Opening += (s, e) => BuildMenu();
+        tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) Toggle(); };
+        poll.Tick += Poll;
+        SystemEvents.DisplaySettingsChanged += (s, e) => { if (active) BuildForms(); };
+        SystemEvents.SessionSwitch += (s, e) =>
+        {
+            if (e.Reason == SessionSwitchReason.SessionLock && Settings.EndOnLock) Stop();
+        };
+        if (!hotkey.Registered)
+            tray.ShowBalloonTip(5000, "Blackout", "Ctrl+Alt+B is used by another app, so the hotkey is unavailable.", ToolTipIcon.Warning);
+    }
+
+    public void Toggle() { if (active) Stop(); else Start(); }
+    public void RequestStop() { ui.Post(delegate { Stop(); }, null); }
+
+    public void Start()
+    {
+        if (active) return;
+        active = true;
+        BuildForms();
+        PrimaryForm().Flash("Press escape to exit", "Segoe UI", 28, 2.5);
+        if (!cursorHidden) { Cursor.Hide(); cursorHidden = true; }
+        ApplyKeepAwake();
+        endAt = Settings.TimerMinutes > 0 ? DateTime.Now.AddMinutes(Settings.TimerMinutes) : (DateTime?)null;
+        startedAt = DateTime.Now;
+        anchor = Cursor.Position;
+        poll.Start();
+    }
+
+    public void Stop()
+    {
+        if (!active) return;
+        active = false;
+        poll.Stop();
+        foreach (var f in forms) f.Dispose();
+        forms.Clear();
+        if (cursorHidden) { Cursor.Show(); cursorHidden = false; }
+        ApplyKeepAwake();
+        if (!Settings.ShownTrayTip)
+        {
+            Settings.ShownTrayTip = true;
+            Settings.Save();
+            tray.ShowBalloonTip(5000, "Blackout is still running",
+                "Press Ctrl+Alt+B or click the tray icon to black out again. Right-click for options.", ToolTipIcon.None);
+        }
+    }
+
+    void ApplyKeepAwake()
+    {
+        SetThreadExecutionState(active && Settings.KeepAwake
+            ? ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
+            : ES_CONTINUOUS);
+    }
+
+    void BuildForms()
+    {
+        foreach (var f in forms) f.Dispose();
+        forms.Clear();
+        var screens = Screen.AllScreens.Where(s => !Settings.ExcludedDisplays.Contains(s.DeviceName)).ToArray();
+        if (screens.Length == 0) screens = Screen.AllScreens;
+        foreach (var s in screens) forms.Add(new BlackForm(this, s));
+        foreach (var f in forms) f.Show();
+        PrimaryForm().Activate();
+    }
+
+    BlackForm PrimaryForm()
+    {
+        return forms.FirstOrDefault(f => f.Bounds == Screen.PrimaryScreen.Bounds) ?? forms[0];
+    }
+
+    void Poll(object sender, EventArgs e)
+    {
+        if (endAt.HasValue && DateTime.Now >= endAt.Value) { Stop(); return; }
+        var p = Cursor.Position;
+        // Ignore the mouse briefly after starting, so the click/hotkey that started it doesn't end it.
+        if ((DateTime.Now - startedAt).TotalSeconds < 1) { anchor = p; return; }
+        if (Math.Abs(p.X - anchor.X) + Math.Abs(p.Y - anchor.Y) < 6) return;
+        anchor = p;
+        if (Settings.ExitOnInput) { Stop(); return; }
+        if (Settings.ClockOnMove)
+        {
+            var f = forms.FirstOrDefault(x => x.Bounds.Contains(p));
+            if (f != null) f.Flash(DateTime.Now.ToString("t"), "Segoe UI Light", 160, 2.0);
+        }
+    }
+
+    void BuildMenu()
+    {
+        var items = tray.ContextMenuStrip.Items;
+        items.Clear();
+        items.Add(new ToolStripMenuItem("Blackout " + Application.ProductVersion) { Enabled = false });
+        items.Add(new ToolStripSeparator());
+
+        var toggle = new ToolStripMenuItem(active ? "End blackout" : "Black out now", null, (s, e) => Toggle());
+        toggle.ShortcutKeyDisplayString = "Ctrl+Alt+B";
+        toggle.Font = new Font(toggle.Font, FontStyle.Bold);
+        items.Add(toggle);
+        items.Add(new ToolStripSeparator());
+
+        var displays = new ToolStripMenuItem("Displays");
+        var screens = Screen.AllScreens;
+        for (int i = 0; i < screens.Length; i++)
+        {
+            var s = screens[i];
+            var name = string.Format("Display {0}{1} — {2}×{3}", i + 1, s.Primary ? " (main)" : "", s.Bounds.Width, s.Bounds.Height);
+            var item = new ToolStripMenuItem(name) { Checked = !Settings.ExcludedDisplays.Contains(s.DeviceName) };
+            item.Click += (o, e) =>
+            {
+                if (!Settings.ExcludedDisplays.Remove(s.DeviceName)) Settings.ExcludedDisplays.Add(s.DeviceName);
+                Settings.Save();
+                if (active) BuildForms();
+            };
+            displays.DropDownItems.Add(item);
+        }
+        items.Add(displays);
+
+        var timer = new ToolStripMenuItem("Auto-exit");
+        foreach (var m in TimerChoices)
+        {
+            int minutes = m;
+            var label = minutes == 0 ? "Never" : minutes < 60 ? minutes + " minutes" : (minutes / 60) + (minutes == 60 ? " hour" : " hours");
+            timer.DropDownItems.Add(new ToolStripMenuItem(label, null, (o, e) =>
+            {
+                Settings.TimerMinutes = minutes;
+                Settings.Save();
+                if (active) endAt = minutes > 0 ? DateTime.Now.AddMinutes(minutes) : (DateTime?)null;
+            }) { Checked = Settings.TimerMinutes == minutes });
+        }
+        items.Add(timer);
+        items.Add(new ToolStripSeparator());
+
+        items.Add(Option("Keep display awake", Settings.KeepAwake, v => { Settings.KeepAwake = v; ApplyKeepAwake(); }));
+        items.Add(Option("Exit on mouse move or any key", Settings.ExitOnInput, v => Settings.ExitOnInput = v));
+        items.Add(Option("Show clock on mouse move", Settings.ClockOnMove, v => Settings.ClockOnMove = v));
+        items.Add(Option("End blackout when PC locks", Settings.EndOnLock, v => Settings.EndOnLock = v));
+        items.Add(new ToolStripMenuItem("Start with Windows", null, (s, e) => StartWithWindows.Set(!StartWithWindows.IsEnabled))
+            { Checked = StartWithWindows.IsEnabled });
+        items.Add(new ToolStripSeparator());
+        items.Add(new ToolStripMenuItem("Quit Blackout", null, (s, e) => Quit()));
+    }
+
+    static ToolStripMenuItem Option(string text, bool value, Action<bool> set)
+    {
+        return new ToolStripMenuItem(text, null, (s, e) => { set(!value); Settings.Save(); }) { Checked = value };
+    }
+
+    void Quit()
+    {
+        Stop();
+        tray.Visible = false;
+        hotkey.Dispose();
+        ExitThread();
+    }
+
+    // White-outlined black rounded square, visible on light and dark taskbars.
+    static Icon MakeTrayIcon()
+    {
+        using (var bmp = new Bitmap(32, 32))
+        using (var g = Graphics.FromImage(bmp))
+        using (var path = RoundedRect(new RectangleF(3, 3, 26, 26), 6))
+        using (var pen = new Pen(Color.White, 2.5f))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.FillPath(Brushes.Black, path);
+            g.DrawPath(pen, path);
+            return Icon.FromHandle(bmp.GetHicon());
+        }
+    }
+
+    static GraphicsPath RoundedRect(RectangleF r, float radius)
+    {
+        float d = radius * 2;
+        var p = new GraphicsPath();
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+}
+
+static class Program
+{
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int processId);
+
+    [STAThread]
+    static void Main(string[] args)
+    {
+        // Per-monitor DPI awareness so Screen.Bounds are real pixels on scaled displays.
+        try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch (EntryPointNotFoundException) { SetProcessDPIAware(); }
+
+        // Single instance: launching again just tells the running copy to black out.
+        bool isFirst;
+        var mutex = new Mutex(true, @"Local\Blackout.Instance", out isFirst);
+        var activate = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\Blackout.Activate");
+        if (!isFirst)
+        {
+            AllowSetForegroundWindow(-1);
+            activate.Set();
+            return;
+        }
+
+        Application.EnableVisualStyles();
+        SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+        Settings.Load();
+        StartWithWindows.Refresh();
+        var controller = new Controller();
+        var ui = SynchronizationContext.Current;
+        ThreadPool.RegisterWaitForSingleObject(activate, (state, timedOut) => ui.Post(delegate { controller.Start(); }, null), null, -1, false);
+
+        if (!args.Contains("--background")) controller.Start();
+        Application.Run(controller);
+        GC.KeepAlive(mutex);
+    }
+}
