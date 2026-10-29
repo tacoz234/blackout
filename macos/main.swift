@@ -38,6 +38,11 @@ extension NSScreen {
 final class BlackWindow: NSWindow {
     let targetScreen: NSScreen
     var onEnd: (() -> Void)?
+    var onMouseMove: (() -> Void)?
+    // Set when the app didn't take focus: NSCursor.hide() then wouldn't stick, so the cursor is
+    // swapped for a blank one only while it's over this window.
+    var blanksCursor = false
+    private static let blankCursor = NSCursor(image: NSImage(size: NSSize(width: 1, height: 1)), hotSpot: .zero)
     private let overlay = NSTextField(labelWithString: "")
     private var flashGeneration = 0
 
@@ -62,6 +67,10 @@ final class BlackWindow: NSWindow {
             overlay.centerXAnchor.constraint(equalTo: content.centerXAnchor),
             overlay.centerYAnchor.constraint(equalTo: content.centerYAnchor),
         ])
+        // Mouse movement is event-driven (no polling), and only over this window, even when unfocused.
+        content.addTrackingArea(NSTrackingArea(
+            rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self, userInfo: nil))
     }
 
     override var canBecomeKey: Bool { true }
@@ -75,6 +84,19 @@ final class BlackWindow: NSWindow {
 
     override func mouseDown(with event: NSEvent) {
         if Settings.exitOnInput { onEnd?() }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if blanksCursor { Self.blankCursor.set() }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        if blanksCursor { Self.blankCursor.set() }
+        onMouseMove?()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if blanksCursor { NSCursor.arrow.set() }
     }
 
     // Shows centered text, holds it, then fades it out over 1s. Calling again restarts the hold.
@@ -97,9 +119,9 @@ final class BlackWindow: NSWindow {
 final class BlackoutController {
     private(set) var isActive = false
     private var windows: [BlackWindow] = []
-    private var pollTimer: Timer?
+    private var autoExitTimer: Timer?
+    private var tookFocus = false
     private var startedAt = Date()
-    private var endAt: Date?
     private var anchor = NSPoint.zero
     private var assertion: IOPMAssertionID = 0
 
@@ -108,50 +130,71 @@ final class BlackoutController {
     func start() {
         guard !isActive else { return }
         isActive = true
-        NSApp.activate(ignoringOtherApps: true)
+        // Only take focus when every screen is covered, so blacking out a second display never
+        // pulls focus from a fullscreen game on the main one.
+        tookFocus = coveredScreens().count == NSScreen.screens.count
+        if tookFocus {
+            NSApp.activate(ignoringOtherApps: true)
+            NSCursor.hide()
+        }
         buildWindows()
-        primaryWindow?.flash("Press escape to exit", font: .systemFont(ofSize: 28, weight: .medium), hold: 2.5)
-        NSCursor.hide()
+        let hint = tookFocus || !Hotkey.isRegistered ? "Press escape to exit" : "Press ⌃⌥⌘B to exit"
+        primaryWindow?.flash(hint, font: .systemFont(ofSize: 28, weight: .medium), hold: 2.5)
         applyKeepAwake()
         resetTimer()
         startedAt = Date()
         anchor = NSEvent.mouseLocation
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.poll() }
     }
 
     func stop() {
         guard isActive else { return }
         isActive = false
-        pollTimer?.invalidate()
-        pollTimer = nil
+        autoExitTimer?.invalidate()
+        autoExitTimer = nil
         windows.forEach { $0.orderOut(nil) }
         windows = []
         NSApp.presentationOptions = []
-        NSCursor.unhide()
+        if tookFocus {
+            NSCursor.unhide()
+            NSApp.hide(nil)   // hand focus back to the previous app
+        } else {
+            NSCursor.arrow.set()   // in case the blank cursor was showing
+        }
         applyKeepAwake()
-        NSApp.hide(nil)   // hand focus back to the previous app
+    }
+
+    private func coveredScreens() -> [NSScreen] {
+        let screens = NSScreen.screens.filter { !Settings.excludedDisplays.contains($0.stableKey) }
+        return screens.isEmpty ? NSScreen.screens : screens
     }
 
     func buildWindows() {
         windows.forEach { $0.orderOut(nil) }
-        let all = NSScreen.screens
-        var screens = all.filter { !Settings.excludedDisplays.contains($0.stableKey) }
-        if screens.isEmpty { screens = all }
+        let screens = coveredScreens()
         // Only lock down the Dock/menu bar/app switching when every screen is covered;
         // otherwise the uncovered screens should stay usable.
-        NSApp.presentationOptions = screens.count == all.count
+        NSApp.presentationOptions = tookFocus && screens.count == NSScreen.screens.count
             ? [.hideDock, .hideMenuBar, .disableProcessSwitching] : []
         windows = screens.map { screen in
             let w = BlackWindow(screen: screen)
             w.onEnd = { [weak self] in DispatchQueue.main.async { self?.stop() } }
-            w.makeKeyAndOrderFront(nil)
+            w.onMouseMove = { [weak self, weak w] in if let w { self?.mouseMoved(in: w) } }
+            w.blanksCursor = !tookFocus
+            if tookFocus { w.makeKeyAndOrderFront(nil) } else { w.orderFrontRegardless() }
             return w
         }
-        primaryWindow?.makeKey()
+        if tookFocus { primaryWindow?.makeKey() }
     }
 
     func resetTimer() {
-        endAt = Settings.timerMinutes > 0 ? Date().addingTimeInterval(TimeInterval(Settings.timerMinutes * 60)) : nil
+        autoExitTimer?.invalidate()
+        autoExitTimer = nil
+        guard Settings.timerMinutes > 0 else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(Settings.timerMinutes * 60), repeats: false) {
+            [weak self] _ in self?.stop()
+        }
+        timer.tolerance = 5
+        autoExitTimer = timer
     }
 
     func applyKeepAwake() {
@@ -171,17 +214,18 @@ final class BlackoutController {
         return windows.first { $0.targetScreen.displayID == main } ?? windows.first
     }
 
-    private func poll() {
-        if let endAt, Date() >= endAt { stop(); return }
+    // Called when the mouse moves over one of the black windows (movement elsewhere is ignored).
+    private func mouseMoved(in window: BlackWindow) {
+        guard isActive else { return }
         let p = NSEvent.mouseLocation
         // Ignore the mouse briefly after starting, so the click/hotkey that started it doesn't end it.
         if Date().timeIntervalSince(startedAt) < 1 { anchor = p; return }
         guard abs(p.x - anchor.x) + abs(p.y - anchor.y) >= 6 else { return }
         anchor = p
-        if Settings.exitOnInput { stop(); return }
-        if Settings.clockOnMove, let w = windows.first(where: { NSMouseInRect(p, $0.frame, false) }) {
+        if Settings.exitOnInput { DispatchQueue.main.async { self.stop() }; return }
+        if Settings.clockOnMove {
             let time = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-            w.flash(time, font: .systemFont(ofSize: 160, weight: .ultraLight), hold: 2)
+            window.flash(time, font: .systemFont(ofSize: 160, weight: .ultraLight), hold: 2)
         }
     }
 }
@@ -189,6 +233,7 @@ final class BlackoutController {
 // System-wide hotkey via Carbon, which needs no Accessibility permission.
 enum Hotkey {
     static var handler: (() -> Void)?
+    private(set) static var isRegistered = false
     private static var ref: EventHotKeyRef?
 
     static func register(_ handler: @escaping () -> Void) -> Bool {
@@ -201,7 +246,8 @@ enum Hotkey {
         let id = EventHotKeyID(signature: OSType(0x424C_4B54), id: 1)   // 'BLKT'
         let status = RegisterEventHotKey(UInt32(kVK_ANSI_B), UInt32(cmdKey | optionKey | controlKey),
                                          id, GetApplicationEventTarget(), 0, &ref)
-        return status == noErr
+        isRegistered = status == noErr
+        return isRegistered
     }
 }
 
