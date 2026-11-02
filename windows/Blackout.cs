@@ -95,6 +95,7 @@ sealed class BlackForm : Form
     readonly Timer fadeTimer = new Timer { Interval = 16 };
     readonly float scale;
     DateTime fadeAt;
+    Font font;
 
     public BlackForm(Controller owner, Screen screen)
     {
@@ -112,13 +113,28 @@ sealed class BlackForm : Form
         overlay = new Label { AutoSize = true, BackColor = Color.Black, Visible = false };
         Controls.Add(overlay);
         fadeTimer.Tick += FadeTick;
+        // Mouse input is event-driven (no polling); the label sits on top, so forward its events too.
+        MouseEventHandler moved = (s, e) => owner.MouseMoved(this);
+        MouseMove += moved;
+        overlay.MouseMove += moved;
+        overlay.MouseDown += (s, e) => OnMouseDown(e);
     }
+
+    // Never steal focus just by appearing (e.g. from a fullscreen game on another display).
+    // The controller activates a window explicitly when it should take the keyboard.
+    protected override bool ShowWithoutActivation { get { return true; } }
 
     // Shows centered text, holds it, then fades it to black over 1s. Calling again restarts the hold.
     public void Flash(string text, string fontName, float px, double holdSeconds)
     {
-        var font = new Font(fontName, px * scale, FontStyle.Regular, GraphicsUnit.Pixel);
-        if (overlay.Text != text || !overlay.Font.Equals(font)) { overlay.Font = font; overlay.Text = text; }
+        if (font == null || font.Name != fontName || font.Size != px * scale)
+        {
+            var old = font;
+            font = new Font(fontName, px * scale, FontStyle.Regular, GraphicsUnit.Pixel);
+            overlay.Font = font;
+            if (old != null) old.Dispose();
+        }
+        if (overlay.Text != text) overlay.Text = text;
         overlay.ForeColor = Color.FromArgb(Gray, Gray, Gray);
         overlay.Size = overlay.PreferredSize;
         overlay.Location = new Point((ClientSize.Width - overlay.Width) / 2, (ClientSize.Height - overlay.Height) / 2);
@@ -155,8 +171,8 @@ sealed class BlackForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) fadeTimer.Dispose();
         base.Dispose(disposing);
+        if (disposing) { fadeTimer.Dispose(); if (font != null) font.Dispose(); }
     }
 }
 
@@ -190,17 +206,19 @@ sealed class Controller : ApplicationContext
 {
     const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x1, ES_DISPLAY_REQUIRED = 0x2;
     [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")] static extern bool SetProcessWorkingSetSize(IntPtr process, IntPtr min, IntPtr max);
 
     static readonly int[] TimerChoices = { 0, 15, 30, 60, 120, 240 };
 
     readonly List<BlackForm> forms = new List<BlackForm>();
     readonly NotifyIcon tray;
     readonly HotkeyWindow hotkey;
-    readonly Timer poll = new Timer { Interval = 50 };
+    readonly Timer autoExit = new Timer();
     readonly SynchronizationContext ui = SynchronizationContext.Current;
+    static readonly Font BoldMenuFont = new Font(SystemFonts.MenuFont, FontStyle.Bold);
     bool active, cursorHidden;
     DateTime startedAt;
-    DateTime? endAt;
     Point anchor;
 
     public Controller()
@@ -208,15 +226,32 @@ sealed class Controller : ApplicationContext
         hotkey = new HotkeyWindow(Toggle);
         tray = new NotifyIcon { Icon = MakeTrayIcon(), Text = "Blackout", Visible = true, ContextMenuStrip = new ContextMenuStrip() };
         tray.ContextMenuStrip.Opening += (s, e) => BuildMenu();
+        KeepOpenOnClick(tray.ContextMenuStrip);
         tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) Toggle(); };
-        poll.Tick += Poll;
-        SystemEvents.DisplaySettingsChanged += (s, e) => { if (active) BuildForms(); };
+        autoExit.Tick += (s, e) => Stop();
+        // Games change resolution often; rebuild without grabbing focus unless we already had it.
+        SystemEvents.DisplaySettingsChanged += (s, e) => { if (active) BuildForms(forms.Contains(Form.ActiveForm)); };
         SystemEvents.SessionSwitch += (s, e) =>
         {
             if (e.Reason == SessionSwitchReason.SessionLock && Settings.EndOnLock) Stop();
         };
         if (!hotkey.Registered)
             tray.ShowBalloonTip(5000, "Blackout", "Ctrl+Alt+B is used by another app, so the hotkey is unavailable.", ToolTipIcon.Warning);
+        Application.Idle += TrimOnceIdle;
+    }
+
+    void TrimOnceIdle(object sender, EventArgs e)
+    {
+        Application.Idle -= TrimOnceIdle;
+        TrimMemory();
+    }
+
+    // Hands startup/blackout memory back to Windows while sitting in the tray.
+    static void TrimMemory()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        SetProcessWorkingSetSize(GetCurrentProcess(), new IntPtr(-1), new IntPtr(-1));
     }
 
     public void Toggle() { if (active) Stop(); else Start(); }
@@ -226,21 +261,24 @@ sealed class Controller : ApplicationContext
     {
         if (active) return;
         active = true;
-        BuildForms();
-        PrimaryForm().Flash("Press escape to exit", "Segoe UI", 28, 2.5);
-        if (!cursorHidden) { Cursor.Hide(); cursorHidden = true; }
+        // Only take the keyboard when every screen is covered, so blacking out a second display
+        // never pulls focus from (and minimizes) a fullscreen game on the main one.
+        bool coversAll = CoveredScreens().Length == Screen.AllScreens.Length;
+        BuildForms(coversAll);
+        PrimaryForm().Flash(coversAll || !hotkey.Registered ? "Press escape to exit" : "Press Ctrl+Alt+B to exit",
+            "Segoe UI", 28, 2.5);
+        if (!cursorHidden) { Cursor.Hide(); cursorHidden = true; }   // only applies over our own windows
         ApplyKeepAwake();
-        endAt = Settings.TimerMinutes > 0 ? DateTime.Now.AddMinutes(Settings.TimerMinutes) : (DateTime?)null;
+        ResetAutoExit();
         startedAt = DateTime.Now;
         anchor = Cursor.Position;
-        poll.Start();
     }
 
     public void Stop()
     {
         if (!active) return;
         active = false;
-        poll.Stop();
+        autoExit.Stop();
         foreach (var f in forms) f.Dispose();
         forms.Clear();
         if (cursorHidden) { Cursor.Show(); cursorHidden = false; }
@@ -252,6 +290,15 @@ sealed class Controller : ApplicationContext
             tray.ShowBalloonTip(5000, "Blackout is still running",
                 "Press Ctrl+Alt+B or click the tray icon to black out again. Right-click for options.", ToolTipIcon.None);
         }
+        TrimMemory();
+    }
+
+    void ResetAutoExit()
+    {
+        autoExit.Stop();
+        if (Settings.TimerMinutes <= 0) return;
+        autoExit.Interval = Settings.TimerMinutes * 60000;
+        autoExit.Start();
     }
 
     void ApplyKeepAwake()
@@ -261,15 +308,19 @@ sealed class Controller : ApplicationContext
             : ES_CONTINUOUS);
     }
 
-    void BuildForms()
+    static Screen[] CoveredScreens()
+    {
+        var screens = Screen.AllScreens.Where(s => !Settings.ExcludedDisplays.Contains(s.DeviceName)).ToArray();
+        return screens.Length > 0 ? screens : Screen.AllScreens;
+    }
+
+    void BuildForms(bool activate)
     {
         foreach (var f in forms) f.Dispose();
         forms.Clear();
-        var screens = Screen.AllScreens.Where(s => !Settings.ExcludedDisplays.Contains(s.DeviceName)).ToArray();
-        if (screens.Length == 0) screens = Screen.AllScreens;
-        foreach (var s in screens) forms.Add(new BlackForm(this, s));
+        foreach (var s in CoveredScreens()) forms.Add(new BlackForm(this, s));
         foreach (var f in forms) f.Show();
-        PrimaryForm().Activate();
+        if (activate) PrimaryForm().Activate();
     }
 
     BlackForm PrimaryForm()
@@ -277,36 +328,34 @@ sealed class Controller : ApplicationContext
         return forms.FirstOrDefault(f => f.Bounds == Screen.PrimaryScreen.Bounds) ?? forms[0];
     }
 
-    void Poll(object sender, EventArgs e)
+    // Called when the mouse moves over one of the black windows (movement elsewhere is ignored).
+    public void MouseMoved(BlackForm form)
     {
-        if (endAt.HasValue && DateTime.Now >= endAt.Value) { Stop(); return; }
+        if (!active) return;
         var p = Cursor.Position;
         // Ignore the mouse briefly after starting, so the click/hotkey that started it doesn't end it.
         if ((DateTime.Now - startedAt).TotalSeconds < 1) { anchor = p; return; }
         if (Math.Abs(p.X - anchor.X) + Math.Abs(p.Y - anchor.Y) < 6) return;
         anchor = p;
-        if (Settings.ExitOnInput) { Stop(); return; }
-        if (Settings.ClockOnMove)
-        {
-            var f = forms.FirstOrDefault(x => x.Bounds.Contains(p));
-            if (f != null) f.Flash(DateTime.Now.ToString("t"), "Segoe UI Light", 160, 2.0);
-        }
+        if (Settings.ExitOnInput) { RequestStop(); return; }
+        if (Settings.ClockOnMove) form.Flash(DateTime.Now.ToString("t"), "Segoe UI Light", 160, 2.0);
     }
 
     void BuildMenu()
     {
         var items = tray.ContextMenuStrip.Items;
-        items.Clear();
+        foreach (var old in items.Cast<ToolStripItem>().ToList()) old.Dispose();
         items.Add(new ToolStripMenuItem("Blackout " + Application.ProductVersion) { Enabled = false });
         items.Add(new ToolStripSeparator());
 
-        var toggle = new ToolStripMenuItem(active ? "End blackout" : "Black out now", null, (s, e) => Toggle());
+        var toggle = new ToolStripMenuItem(active ? "End blackout" : "Black out now", null, (s, e) => { CloseMenu(); Toggle(); });
         toggle.ShortcutKeyDisplayString = "Ctrl+Alt+B";
-        toggle.Font = new Font(toggle.Font, FontStyle.Bold);
+        toggle.Font = BoldMenuFont;
         items.Add(toggle);
         items.Add(new ToolStripSeparator());
 
         var displays = new ToolStripMenuItem("Displays");
+        KeepOpenOnClick(displays.DropDown);
         var screens = Screen.AllScreens;
         for (int i = 0; i < screens.Length; i++)
         {
@@ -316,23 +365,26 @@ sealed class Controller : ApplicationContext
             item.Click += (o, e) =>
             {
                 if (!Settings.ExcludedDisplays.Remove(s.DeviceName)) Settings.ExcludedDisplays.Add(s.DeviceName);
+                item.Checked = !Settings.ExcludedDisplays.Contains(s.DeviceName);
                 Settings.Save();
-                if (active) BuildForms();
+                if (active) BuildForms(forms.Contains(Form.ActiveForm));
             };
             displays.DropDownItems.Add(item);
         }
         items.Add(displays);
 
         var timer = new ToolStripMenuItem("Auto-exit");
+        KeepOpenOnClick(timer.DropDown);
         foreach (var m in TimerChoices)
         {
             int minutes = m;
             var label = minutes == 0 ? "Never" : minutes < 60 ? minutes + " minutes" : (minutes / 60) + (minutes == 60 ? " hour" : " hours");
             timer.DropDownItems.Add(new ToolStripMenuItem(label, null, (o, e) =>
             {
+                foreach (ToolStripMenuItem other in timer.DropDownItems) other.Checked = other == o;
                 Settings.TimerMinutes = minutes;
                 Settings.Save();
-                if (active) endAt = minutes > 0 ? DateTime.Now.AddMinutes(minutes) : (DateTime?)null;
+                if (active) ResetAutoExit();
             }) { Checked = Settings.TimerMinutes == minutes });
         }
         items.Add(timer);
@@ -342,16 +394,33 @@ sealed class Controller : ApplicationContext
         items.Add(Option("Exit on mouse move or any key", Settings.ExitOnInput, v => Settings.ExitOnInput = v));
         items.Add(Option("Show clock on mouse move", Settings.ClockOnMove, v => Settings.ClockOnMove = v));
         items.Add(Option("End blackout when PC locks", Settings.EndOnLock, v => Settings.EndOnLock = v));
-        items.Add(new ToolStripMenuItem("Start with Windows", null, (s, e) => StartWithWindows.Set(!StartWithWindows.IsEnabled))
-            { Checked = StartWithWindows.IsEnabled });
+        items.Add(new ToolStripMenuItem("Start with Windows", null, (s, e) =>
+        {
+            StartWithWindows.Set(!StartWithWindows.IsEnabled);
+            ((ToolStripMenuItem)s).Checked = StartWithWindows.IsEnabled;
+        }) { Checked = StartWithWindows.IsEnabled });
         items.Add(new ToolStripSeparator());
-        items.Add(new ToolStripMenuItem("Quit Blackout", null, (s, e) => Quit()));
+        items.Add(new ToolStripMenuItem("Quit Blackout", null, (s, e) => { CloseMenu(); Quit(); }));
     }
 
     static ToolStripMenuItem Option(string text, bool value, Action<bool> set)
     {
-        return new ToolStripMenuItem(text, null, (s, e) => { set(!value); Settings.Save(); }) { Checked = value };
+        return new ToolStripMenuItem(text, null, (s, e) =>
+        {
+            var item = (ToolStripMenuItem)s;
+            item.Checked = !item.Checked;
+            set(item.Checked);
+            Settings.Save();
+        }) { Checked = value };
     }
+
+    // Clicking an option leaves the menu open so several can be changed; clicking elsewhere closes it.
+    static void KeepOpenOnClick(ToolStripDropDown menu)
+    {
+        menu.Closing += (s, e) => { if (e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true; };
+    }
+
+    void CloseMenu() { tray.ContextMenuStrip.Close(); }
 
     void Quit()
     {
@@ -407,6 +476,7 @@ static class Program
         var activate = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\Blackout.Activate");
         if (!isFirst)
         {
+            if (args.Contains("--background")) return;
             AllowSetForegroundWindow(-1);
             activate.Set();
             return;

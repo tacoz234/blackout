@@ -13,6 +13,10 @@ Opening Blackout blacks out immediately. Afterwards it stays in the menu bar (ma
 | End blackout | Escape or ⌘Q | Escape or Alt+F4 |
 | Options & quit | menu bar icon | right-click the tray icon |
 
+**Gaming on another display:** if only some displays are blacked out, Blackout never takes focus,
+so a fullscreen game on the uncovered display keeps running. End it with the hotkey, or click the black screen and press Escape.
+Blackout uses essentially no CPU, whether idle in the tray/menu bar or blacked out: it doesn't poll, it just waits for events.
+
 ## Options
 
 All saved between launches:
