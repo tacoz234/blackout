@@ -226,6 +226,7 @@ sealed class Controller : ApplicationContext
         hotkey = new HotkeyWindow(Toggle);
         tray = new NotifyIcon { Icon = MakeTrayIcon(), Text = "Blackout", Visible = true, ContextMenuStrip = new ContextMenuStrip() };
         tray.ContextMenuStrip.Opening += (s, e) => BuildMenu();
+        KeepOpenOnClick(tray.ContextMenuStrip);
         tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) Toggle(); };
         autoExit.Tick += (s, e) => Stop();
         // Games change resolution often; rebuild without grabbing focus unless we already had it.
@@ -347,13 +348,14 @@ sealed class Controller : ApplicationContext
         items.Add(new ToolStripMenuItem("Blackout " + Application.ProductVersion) { Enabled = false });
         items.Add(new ToolStripSeparator());
 
-        var toggle = new ToolStripMenuItem(active ? "End blackout" : "Black out now", null, (s, e) => Toggle());
+        var toggle = new ToolStripMenuItem(active ? "End blackout" : "Black out now", null, (s, e) => { CloseMenu(); Toggle(); });
         toggle.ShortcutKeyDisplayString = "Ctrl+Alt+B";
         toggle.Font = BoldMenuFont;
         items.Add(toggle);
         items.Add(new ToolStripSeparator());
 
         var displays = new ToolStripMenuItem("Displays");
+        KeepOpenOnClick(displays.DropDown);
         var screens = Screen.AllScreens;
         for (int i = 0; i < screens.Length; i++)
         {
@@ -363,6 +365,7 @@ sealed class Controller : ApplicationContext
             item.Click += (o, e) =>
             {
                 if (!Settings.ExcludedDisplays.Remove(s.DeviceName)) Settings.ExcludedDisplays.Add(s.DeviceName);
+                item.Checked = !Settings.ExcludedDisplays.Contains(s.DeviceName);
                 Settings.Save();
                 if (active) BuildForms(forms.Contains(Form.ActiveForm));
             };
@@ -371,12 +374,14 @@ sealed class Controller : ApplicationContext
         items.Add(displays);
 
         var timer = new ToolStripMenuItem("Auto-exit");
+        KeepOpenOnClick(timer.DropDown);
         foreach (var m in TimerChoices)
         {
             int minutes = m;
             var label = minutes == 0 ? "Never" : minutes < 60 ? minutes + " minutes" : (minutes / 60) + (minutes == 60 ? " hour" : " hours");
             timer.DropDownItems.Add(new ToolStripMenuItem(label, null, (o, e) =>
             {
+                foreach (ToolStripMenuItem other in timer.DropDownItems) other.Checked = other == o;
                 Settings.TimerMinutes = minutes;
                 Settings.Save();
                 if (active) ResetAutoExit();
@@ -389,16 +394,33 @@ sealed class Controller : ApplicationContext
         items.Add(Option("Exit on mouse move or any key", Settings.ExitOnInput, v => Settings.ExitOnInput = v));
         items.Add(Option("Show clock on mouse move", Settings.ClockOnMove, v => Settings.ClockOnMove = v));
         items.Add(Option("End blackout when PC locks", Settings.EndOnLock, v => Settings.EndOnLock = v));
-        items.Add(new ToolStripMenuItem("Start with Windows", null, (s, e) => StartWithWindows.Set(!StartWithWindows.IsEnabled))
-            { Checked = StartWithWindows.IsEnabled });
+        items.Add(new ToolStripMenuItem("Start with Windows", null, (s, e) =>
+        {
+            StartWithWindows.Set(!StartWithWindows.IsEnabled);
+            ((ToolStripMenuItem)s).Checked = StartWithWindows.IsEnabled;
+        }) { Checked = StartWithWindows.IsEnabled });
         items.Add(new ToolStripSeparator());
-        items.Add(new ToolStripMenuItem("Quit Blackout", null, (s, e) => Quit()));
+        items.Add(new ToolStripMenuItem("Quit Blackout", null, (s, e) => { CloseMenu(); Quit(); }));
     }
 
     static ToolStripMenuItem Option(string text, bool value, Action<bool> set)
     {
-        return new ToolStripMenuItem(text, null, (s, e) => { set(!value); Settings.Save(); }) { Checked = value };
+        return new ToolStripMenuItem(text, null, (s, e) =>
+        {
+            var item = (ToolStripMenuItem)s;
+            item.Checked = !item.Checked;
+            set(item.Checked);
+            Settings.Save();
+        }) { Checked = value };
     }
+
+    // Clicking an option leaves the menu open so several can be changed; clicking elsewhere closes it.
+    static void KeepOpenOnClick(ToolStripDropDown menu)
+    {
+        menu.Closing += (s, e) => { if (e.CloseReason == ToolStripDropDownCloseReason.ItemClicked) e.Cancel = true; };
+    }
+
+    void CloseMenu() { tray.ContextMenuStrip.Close(); }
 
     void Quit()
     {
