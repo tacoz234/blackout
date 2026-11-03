@@ -50,11 +50,18 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\Blackout.exe"; Parameters: "--background"; Description: "Start Blackout now"; \
     Flags: nowait postinstall skipifsilent
+; The app's built-in updater runs this installer silently with /RELAUNCH=1 and expects Blackout back afterwards.
+Filename: "{app}\Blackout.exe"; Parameters: "--background"; Flags: nowait; Check: IsUpdate
 
 [Messages]
 FinishedLabel=Blackout lives in the system tray (by the clock). Press Ctrl+Alt+B or click the tray icon to black out your screens, and Escape to come back. Right-click the tray icon for options.
 
 [Code]
+function IsUpdate(): Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
 procedure CloseBlackout();
 var
   ResultCode: Integer;
