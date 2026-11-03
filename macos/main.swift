@@ -390,20 +390,72 @@ enum Updater {
     }
 }
 
-// NSMenuItem that runs a closure.
+// NSMenuItem that runs a closure. `isOn` shows a checkmark; `stayOpen` keeps the menu open
+// after a click (NSMenu always closes after a normal item's action) so several options can be changed.
 final class ActionItem: NSMenuItem {
     private let handler: () -> Void
+    private let isOn: (() -> Bool)?
 
-    init(_ title: String, checked: Bool = false, handler: @escaping () -> Void) {
+    init(_ title: String, isOn: (() -> Bool)? = nil, stayOpen: Bool = false, handler: @escaping () -> Void) {
         self.handler = handler
+        self.isOn = isOn
         super.init(title: title, action: #selector(fire), keyEquivalent: "")
         target = self
-        state = checked ? .on : .off
+        refreshState()
+        if stayOpen { view = StayOpenView(title: title) }
     }
 
     required init(coder: NSCoder) { fatalError("unused") }
 
     @objc private func fire() { handler() }
+
+    func refreshState() { if let isOn = isOn { state = isOn() ? .on : .off } }
+
+    func clickInPlace() {
+        handler()
+        // Refresh siblings too, so picking an auto-exit time moves the checkmark.
+        for case let item as ActionItem in menu?.items ?? [] {
+            item.refreshState()
+            item.view?.needsDisplay = true
+        }
+    }
+}
+
+// Draws an ActionItem like a standard checkmark item. Clicks on a menu item's view don't close the menu.
+final class StayOpenView: NSView {
+    private static let font = NSFont.menuFont(ofSize: 0)
+    private static let checkX: CGFloat = 9, titleX: CGFloat = 22
+
+    init(title: String) {
+        let width = (title as NSString).size(withAttributes: [.font: Self.font]).width + Self.titleX + 20
+        super.init(frame: NSRect(x: 0, y: 0, width: ceil(width), height: 22))
+        autoresizingMask = .width   // the menu stretches it to its full width
+        setAccessibilityRole(.menuItem)
+        setAccessibilityLabel(title)
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let item = enclosingMenuItem else { return }
+        let highlighted = item.isHighlighted
+        if highlighted {
+            NSColor.selectedContentBackgroundColor.setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 5, dy: 0), xRadius: 4, yRadius: 4).fill()
+        }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: Self.font,
+            .foregroundColor: highlighted ? NSColor.selectedMenuItemTextColor : NSColor.labelColor,
+        ]
+        func text(_ string: String, at x: CGFloat) {
+            let height = (string as NSString).size(withAttributes: attrs).height
+            (string as NSString).draw(at: NSPoint(x: x, y: (bounds.height - height) / 2), withAttributes: attrs)
+        }
+        if item.state == .on { text("✓", at: Self.checkX) }
+        text(item.title, at: Self.titleX)
+    }
+
+    override func mouseUp(with event: NSEvent) { (enclosingMenuItem as? ActionItem)?.clickInPlace() }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -544,7 +596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (i, screen) in NSScreen.screens.enumerated() {
             let key = screen.stableKey
             let name = screen.localizedName + (i == 0 ? " (main)" : "")
-            displays.addItem(ActionItem(name, checked: !Settings.excludedDisplays.contains(key)) { [weak self] in
+            displays.addItem(ActionItem(name, isOn: { !Settings.excludedDisplays.contains(key) }, stayOpen: true) { [weak self] in
                 var excluded = Settings.excludedDisplays
                 if excluded.remove(key) == nil { excluded.insert(key) }
                 Settings.excludedDisplays = excluded
@@ -558,7 +610,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let label = minutes == 0 ? "Never"
                 : minutes < 60 ? "\(minutes) minutes"
                 : "\(minutes / 60) hour\(minutes == 60 ? "" : "s")"
-            timer.addItem(ActionItem(label, checked: Settings.timerMinutes == minutes) { [weak self] in
+            timer.addItem(ActionItem(label, isOn: { Settings.timerMinutes == minutes }, stayOpen: true) { [weak self] in
                 Settings.timerMinutes = minutes
                 if self?.blackout.isActive == true { self?.blackout.resetTimer() }
             })
@@ -566,24 +618,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(submenu("Auto-exit", timer))
         menu.addItem(.separator())
 
-        menu.addItem(ActionItem("Keep Display Awake", checked: Settings.keepAwake) { [weak self] in
+        menu.addItem(ActionItem("Keep Display Awake", isOn: { Settings.keepAwake }, stayOpen: true) { [weak self] in
             Settings.keepAwake.toggle()
             self?.blackout.applyKeepAwake()
         })
-        menu.addItem(ActionItem("Exit on Mouse Move or Any Key", checked: Settings.exitOnInput) {
+        menu.addItem(ActionItem("Exit on Mouse Move or Any Key", isOn: { Settings.exitOnInput }, stayOpen: true) {
             Settings.exitOnInput.toggle()
         })
-        menu.addItem(ActionItem("Show Clock on Mouse Move", checked: Settings.clockOnMove) {
+        menu.addItem(ActionItem("Show Clock on Mouse Move", isOn: { Settings.clockOnMove }, stayOpen: true) {
             Settings.clockOnMove.toggle()
         })
-        menu.addItem(ActionItem("End Blackout When Mac Locks", checked: Settings.endOnLock) {
+        menu.addItem(ActionItem("End Blackout When Mac Locks", isOn: { Settings.endOnLock }, stayOpen: true) {
             Settings.endOnLock.toggle()
         })
-        menu.addItem(ActionItem("Open at Login", checked: LoginItem.isEnabled) {
+        menu.addItem(ActionItem("Open at Login", isOn: { LoginItem.isEnabled }, stayOpen: true) {
             LoginItem.set(!LoginItem.isEnabled)
         })
         menu.addItem(.separator())
-        menu.addItem(ActionItem("Check for Updates Automatically", checked: Settings.autoUpdate) {
+        menu.addItem(ActionItem("Check for Updates Automatically", isOn: { Settings.autoUpdate }, stayOpen: true) {
             Settings.autoUpdate.toggle()
         })
         menu.addItem(ActionItem(checkingForUpdate ? "Checking for Updates…" : "Check for Updates…") { [weak self] in
