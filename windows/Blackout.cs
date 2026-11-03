@@ -1,11 +1,16 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using Timer = System.Windows.Forms.Timer;
@@ -16,7 +21,7 @@ using Timer = System.Windows.Forms.Timer;
 
 static class Settings
 {
-    public static bool KeepAwake = true, ExitOnInput = false, ClockOnMove = false, EndOnLock = true, ShownTrayTip = false;
+    public static bool KeepAwake = true, ExitOnInput = false, ClockOnMove = false, EndOnLock = true, ShownTrayTip = false, AutoUpdate = true;
     public static int TimerMinutes = 0;
     public static HashSet<string> ExcludedDisplays = new HashSet<string>();
 
@@ -38,6 +43,7 @@ static class Settings
                 case "ClockOnMove": ClockOnMove = v == "1"; break;
                 case "EndOnLock": EndOnLock = v == "1"; break;
                 case "ShownTrayTip": ShownTrayTip = v == "1"; break;
+                case "AutoUpdate": AutoUpdate = v == "1"; break;
                 case "TimerMinutes": int.TryParse(v, out TimerMinutes); break;
                 case "ExcludedDisplays":
                     ExcludedDisplays = new HashSet<string>(v.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries));
@@ -55,6 +61,7 @@ static class Settings
             "ClockOnMove=" + B(ClockOnMove),
             "EndOnLock=" + B(EndOnLock),
             "ShownTrayTip=" + B(ShownTrayTip),
+            "AutoUpdate=" + B(AutoUpdate),
             "TimerMinutes=" + TimerMinutes,
             "ExcludedDisplays=" + string.Join("|", ExcludedDisplays),
         });
@@ -85,6 +92,79 @@ static class StartWithWindows
 
     // Keeps the entry pointing at this exe if it was moved or reinstalled.
     public static void Refresh() { if (IsEnabled) Set(true); }
+}
+
+// Finds newer releases on GitHub and downloads their installer.
+static class Updater
+{
+    const string LatestRelease = "https://api.github.com/repos/tacoz234/blackout/releases/latest";
+
+    public sealed class Release { public string Version, Url, Sha256; }
+
+    public static string Current { get { return Application.ProductVersion; } }
+
+    // Local and CI test builds (e.g. 0.0.0-dev, 1.1.0-test) only check when asked.
+    public static bool IsDevBuild { get { return Current.Contains("-"); } }
+
+    // The latest release if it's newer than this build, otherwise null. Throws on network errors.
+    public static Release FindNewer()
+    {
+        string json;
+        using (var c = Client()) json = c.DownloadString(LatestRelease);
+        var release = (IDictionary<string, object>)new JavaScriptSerializer().DeserializeObject(json);
+        var version = ((string)release["tag_name"]).TrimStart('v');
+        if (Parse(version) <= Parse(Current)) return null;
+        foreach (IDictionary<string, object> asset in (IEnumerable)release["assets"])
+        {
+            if (!((string)asset["name"]).EndsWith("-windows-setup.exe", StringComparison.OrdinalIgnoreCase)) continue;
+            object digest;
+            asset.TryGetValue("digest", out digest);
+            var d = digest as string;
+            return new Release
+            {
+                Version = version,
+                Url = (string)asset["browser_download_url"],
+                Sha256 = d != null && d.StartsWith("sha256:") ? d.Substring(7) : null,
+            };
+        }
+        return null;
+    }
+
+    // Downloads the installer to a temp folder, checks it against GitHub's hash, and returns its path.
+    public static string Download(Release release)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "Blackout-update");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "Blackout-" + release.Version + "-windows-setup.exe");
+        using (var c = Client()) c.DownloadFile(release.Url, path);
+        if (release.Sha256 != null)
+        {
+            string actual;
+            using (var sha = SHA256.Create())
+            using (var f = File.OpenRead(path))
+                actual = BitConverter.ToString(sha.ComputeHash(f)).Replace("-", "");
+            if (!actual.Equals(release.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                File.Delete(path);
+                throw new InvalidDataException("The download was corrupted. Try again later.");
+            }
+        }
+        return path;
+    }
+
+    static Version Parse(string v)
+    {
+        Version parsed;
+        return Version.TryParse(v.Split('-', '+')[0], out parsed) ? parsed : new Version(0, 0);
+    }
+
+    static WebClient Client()
+    {
+        ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+        var c = new WebClient { Encoding = System.Text.Encoding.UTF8 };
+        c.Headers[HttpRequestHeader.UserAgent] = "Blackout/" + Current;   // required by the GitHub API
+        return c;
+    }
 }
 
 sealed class BlackForm : Form
@@ -215,9 +295,12 @@ sealed class Controller : ApplicationContext
     readonly NotifyIcon tray;
     readonly HotkeyWindow hotkey;
     readonly Timer autoExit = new Timer();
+    readonly Timer updateCheck = new Timer { Interval = 10000 };   // first check shortly after launch, then daily
     readonly SynchronizationContext ui = SynchronizationContext.Current;
     static readonly Font BoldMenuFont = new Font(SystemFonts.MenuFont, FontStyle.Bold);
-    bool active, cursorHidden;
+    bool active, cursorHidden, checkingForUpdate, updating;
+    Updater.Release availableUpdate;
+    string notifiedVersion;
     DateTime startedAt;
     Point anchor;
 
@@ -229,6 +312,8 @@ sealed class Controller : ApplicationContext
         KeepOpenOnClick(tray.ContextMenuStrip);
         tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) Toggle(); };
         autoExit.Tick += (s, e) => Stop();
+        updateCheck.Tick += (s, e) => { updateCheck.Interval = 24 * 60 * 60 * 1000; CheckForUpdates(false); };
+        if (Settings.AutoUpdate && !Updater.IsDevBuild) updateCheck.Start();
         // Games change resolution often; rebuild without grabbing focus unless we already had it.
         SystemEvents.DisplaySettingsChanged += (s, e) => { if (active) BuildForms(forms.Contains(Form.ActiveForm)); };
         SystemEvents.SessionSwitch += (s, e) =>
@@ -341,11 +426,90 @@ sealed class Controller : ApplicationContext
         if (Settings.ClockOnMove) form.Flash(DateTime.Now.ToString("t"), "Segoe UI Light", 160, 2.0);
     }
 
+    void CheckForUpdates(bool manual)
+    {
+        if (checkingForUpdate || updating) return;
+        checkingForUpdate = true;
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            Updater.Release found = null;
+            Exception error = null;
+            try { found = Updater.FindNewer(); } catch (Exception ex) { error = ex; }
+            ui.Post(delegate
+            {
+                checkingForUpdate = false;
+                if (error != null)
+                {
+                    if (manual) tray.ShowBalloonTip(5000, "Couldn't check for updates",
+                        "Check your internet connection and try again.", ToolTipIcon.Warning);
+                    return;
+                }
+                availableUpdate = found;
+                if (found == null)
+                {
+                    if (manual) tray.ShowBalloonTip(5000, "Blackout is up to date",
+                        "You have the latest version (" + Updater.Current + ").", ToolTipIcon.None);
+                }
+                else if (manual)
+                {
+                    if (MessageBox.Show("Blackout " + found.Version + " is available (you have " + Updater.Current + ").\n\nInstall it now?",
+                            "Blackout", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+                        InstallUpdate();
+                }
+                else if (notifiedVersion != found.Version)
+                {
+                    notifiedVersion = found.Version;
+                    tray.ShowBalloonTip(5000, "Blackout " + found.Version + " is available",
+                        "Right-click the tray icon and choose Update to install it.", ToolTipIcon.None);
+                }
+            }, null);
+        });
+    }
+
+    // Downloads the new installer and runs it silently; it closes this copy and restarts Blackout when done.
+    void InstallUpdate()
+    {
+        if (updating || availableUpdate == null) return;
+        updating = true;
+        var release = availableUpdate;
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            string setup = null;
+            Exception error = null;
+            try { setup = Updater.Download(release); } catch (Exception ex) { error = ex; }
+            ui.Post(delegate
+            {
+                updating = false;
+                try
+                {
+                    if (error != null) throw error;
+                    // Keep the current "Start with Windows" choice rather than the installer's default.
+                    var args = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /RELAUNCH=1 /MERGETASKS=\"" +
+                        (StartWithWindows.IsEnabled ? "startup" : "!startup") + "\"";
+                    Process.Start(new ProcessStartInfo(setup, args) { UseShellExecute = true });
+                }
+                catch (Exception ex)
+                {
+                    tray.ShowBalloonTip(5000, "Couldn't install the update", ex.Message, ToolTipIcon.Warning);
+                    return;
+                }
+                Quit();
+            }, null);
+        });
+    }
+
     void BuildMenu()
     {
         var items = tray.ContextMenuStrip.Items;
         foreach (var old in items.Cast<ToolStripItem>().ToList()) old.Dispose();
         items.Add(new ToolStripMenuItem("Blackout " + Application.ProductVersion) { Enabled = false });
+        if (availableUpdate != null)
+        {
+            items.Add(updating
+                ? new ToolStripMenuItem("Downloading update…") { Enabled = false }
+                : new ToolStripMenuItem("Update to Blackout " + availableUpdate.Version, null, (s, e) => { CloseMenu(); InstallUpdate(); })
+                    { Font = BoldMenuFont });
+        }
         items.Add(new ToolStripSeparator());
 
         var toggle = new ToolStripMenuItem(active ? "End blackout" : "Black out now", null, (s, e) => { CloseMenu(); Toggle(); });
@@ -400,6 +564,13 @@ sealed class Controller : ApplicationContext
             ((ToolStripMenuItem)s).Checked = StartWithWindows.IsEnabled;
         }) { Checked = StartWithWindows.IsEnabled });
         items.Add(new ToolStripSeparator());
+        items.Add(Option("Check for updates automatically", Settings.AutoUpdate, v =>
+        {
+            Settings.AutoUpdate = v;
+            if (v && !Updater.IsDevBuild) updateCheck.Start(); else updateCheck.Stop();
+        }));
+        items.Add(new ToolStripMenuItem(checkingForUpdate ? "Checking for updates…" : "Check for updates now", null,
+            (s, e) => { CloseMenu(); CheckForUpdates(true); }) { Enabled = !checkingForUpdate && !updating });
         items.Add(new ToolStripMenuItem("Quit Blackout", null, (s, e) => { CloseMenu(); Quit(); }));
     }
 
@@ -425,6 +596,7 @@ sealed class Controller : ApplicationContext
     void Quit()
     {
         Stop();
+        updateCheck.Stop();
         tray.Visible = false;
         hotkey.Dispose();
         ExitThread();

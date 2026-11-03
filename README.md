@@ -28,6 +28,16 @@ All saved between launches:
 - **Show clock on mouse move** — briefly shows the time on the screen under the cursor, then fades back to black.
 - **End blackout when the computer locks** *(on by default)*.
 - **Start at login** — launches into the tray/menu bar at sign-in without blacking out.
+- **Check for updates automatically** *(on by default)* — see below.
+
+## Updates
+
+Blackout checks GitHub for a new release shortly after it starts and once a day after that.
+When one is out, **Update to Blackout x.y.z** appears at the top of the tray/menu-bar menu (Windows also shows a notification).
+Click it and Blackout downloads the new version, checks it against the SHA-256 hash GitHub publishes for the release,
+installs it in place, and restarts. You can also choose **Check for updates** from the menu at any time.
+The only network request is to the GitHub API for this repository's latest release; turn off
+**Check for updates automatically** to stop it. On macOS the app must be in a folder you can write to (like Applications).
 
 ## Download
 

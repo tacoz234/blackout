@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import CryptoKit
 import IOKit.pwr_mgt
 
 // Pure-black, truly full-screen blackout for OLED displays.
@@ -10,13 +11,15 @@ enum Settings {
 
     static func register() {
         d.register(defaults: ["keepAwake": true, "exitOnInput": false, "clockOnMove": false,
-                              "endOnLock": true, "timerMinutes": 0, "excludedDisplays": [String]()])
+                              "endOnLock": true, "timerMinutes": 0, "excludedDisplays": [String](),
+                              "autoUpdate": true])
     }
 
     static var keepAwake: Bool { get { d.bool(forKey: "keepAwake") } set { d.set(newValue, forKey: "keepAwake") } }
     static var exitOnInput: Bool { get { d.bool(forKey: "exitOnInput") } set { d.set(newValue, forKey: "exitOnInput") } }
     static var clockOnMove: Bool { get { d.bool(forKey: "clockOnMove") } set { d.set(newValue, forKey: "clockOnMove") } }
     static var endOnLock: Bool { get { d.bool(forKey: "endOnLock") } set { d.set(newValue, forKey: "endOnLock") } }
+    static var autoUpdate: Bool { get { d.bool(forKey: "autoUpdate") } set { d.set(newValue, forKey: "autoUpdate") } }
     static var timerMinutes: Int { get { d.integer(forKey: "timerMinutes") } set { d.set(newValue, forKey: "timerMinutes") } }
     static var excludedDisplays: Set<String> {
         get { Set(d.stringArray(forKey: "excludedDisplays") ?? []) }
@@ -278,6 +281,115 @@ enum LoginItem {
     static func refresh() { if isEnabled { set(true) } }
 }
 
+// Finds newer releases on GitHub and installs them over this copy of the app.
+enum Updater {
+    struct Release { let version: String; let url: URL; let sha256: String? }
+
+    struct UpdateError: LocalizedError {
+        let errorDescription: String?
+        init(_ message: String) { errorDescription = message }
+    }
+
+    private struct Latest: Decodable {
+        let tag_name: String
+        let assets: [Asset]
+        struct Asset: Decodable { let name: String; let browser_download_url: URL; let digest: String? }
+    }
+
+    static let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0-dev"
+
+    // Local and CI test builds (e.g. 0.0.0-dev) only check when asked.
+    static var isDevBuild: Bool { current.contains("-") }
+
+    // Calls back on the main queue with the latest release if it's newer than this build, otherwise nil.
+    static func findNewer(_ done: @escaping (Result<Release?, Error>) -> Void) {
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/tacoz234/blackout/releases/latest")!)
+        request.setValue("Blackout/\(current)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            let result = Result<Release?, Error> {
+                if let error = error { throw error }
+                guard let data = data, (response as? HTTPURLResponse)?.statusCode == 200 else {
+                    throw UpdateError("GitHub didn't return the latest release.")
+                }
+                let latest = try JSONDecoder().decode(Latest.self, from: data)
+                let version = latest.tag_name.hasPrefix("v") ? String(latest.tag_name.dropFirst()) : latest.tag_name
+                guard isNewer(version, than: current),
+                      let asset = latest.assets.first(where: { $0.name.hasSuffix("-macos.dmg") }) else { return nil }
+                let sha256 = asset.digest.flatMap { $0.hasPrefix("sha256:") ? String($0.dropFirst(7)) : nil }
+                return Release(version: version, url: asset.browser_download_url, sha256: sha256)
+            }
+            DispatchQueue.main.async { done(result) }
+        }.resume()
+    }
+
+    // Downloads the disk image, checks it against GitHub's hash, swaps the new app in for this one,
+    // and relaunches. On success the app quits; `failed` is called on the main queue otherwise.
+    static func install(_ release: Release, failed: @escaping (Error) -> Void) {
+        let app = Bundle.main.bundleURL
+        // A copy running from the disk image or from App Translocation (a read-only quarantine copy) can't be replaced.
+        if app.path.hasPrefix("/Volumes/") || app.path.contains("/AppTranslocation/") {
+            failed(UpdateError("Move Blackout to your Applications folder, open it from there, and try again."))
+            return
+        }
+        URLSession.shared.downloadTask(with: release.url) { downloaded, _, error in
+            do {
+                if let error = error { throw error }
+                guard let downloaded = downloaded else { throw UpdateError("The download failed.") }
+                let fm = FileManager.default
+                // On the same volume as the app, so the final swap is a simple rename.
+                let work = try fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: app, create: true)
+                defer { try? fm.removeItem(at: work) }
+                let dmg = work.appendingPathComponent("Blackout.dmg")
+                try fm.moveItem(at: downloaded, to: dmg)
+                if let expected = release.sha256 {
+                    let actual = SHA256.hash(data: try Data(contentsOf: dmg)).map { String(format: "%02x", $0) }.joined()
+                    guard actual == expected.lowercased() else { throw UpdateError("The download was corrupted. Try again later.") }
+                }
+                let mount = work.appendingPathComponent("mount")
+                try run("/usr/bin/hdiutil", "attach", dmg.path, "-nobrowse", "-readonly", "-mountpoint", mount.path)
+                defer { try? run("/usr/bin/hdiutil", "detach", mount.path, "-force") }
+                let staged = work.appendingPathComponent("Blackout.app")
+                try run("/usr/bin/ditto", mount.appendingPathComponent("Blackout.app").path, staged.path)
+                _ = try fm.replaceItemAt(app, withItemAt: staged)
+
+                // Wait for this copy to quit, then open the new one into the menu bar.
+                let relaunch = Process()
+                relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+                relaunch.arguments = ["-c", "while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.2; done; open \"$0\" --args --background", app.path]
+                try relaunch.run()
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            } catch {
+                DispatchQueue.main.async { failed(error) }
+            }
+        }.resume()
+    }
+
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        func parts(_ v: String) -> [Int] {
+            let numeric = v.split(whereSeparator: { $0 == "-" || $0 == "+" }).first ?? ""
+            return numeric.split(separator: ".").map { Int($0) ?? 0 }
+        }
+        let x = parts(a), y = parts(b)
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+
+    private static func run(_ tool: String, _ args: String...) throws {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        try p.run()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else {
+            throw UpdateError("\(URL(fileURLWithPath: tool).lastPathComponent) failed while installing the update.")
+        }
+    }
+}
+
 // NSMenuItem that runs a closure.
 final class ActionItem: NSMenuItem {
     private let handler: () -> Void
@@ -298,6 +410,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let blackout = BlackoutController()
     var statusItem: NSStatusItem!
     var hotkeyRegistered = false
+    var availableUpdate: Updater.Release?
+    var checkingForUpdate = false, updating = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         Settings.register()
@@ -310,6 +424,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         hotkeyRegistered = Hotkey.register { [weak self] in self?.blackout.toggle() }
+
+        // First check shortly after launch, then daily.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.checkForUpdates(manual: false) }
+        Timer.scheduledTimer(withTimeInterval: 24 * 60 * 60, repeats: true) { [weak self] _ in
+            self?.checkForUpdates(manual: false)
+        }
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -348,12 +468,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ note: Notification) { blackout.stop() }
 
+    func checkForUpdates(manual: Bool) {
+        guard !checkingForUpdate, !updating, manual || (Settings.autoUpdate && !Updater.isDevBuild) else { return }
+        checkingForUpdate = true
+        Updater.findNewer { [weak self] result in
+            guard let self = self else { return }
+            self.checkingForUpdate = false
+            switch result {
+            case .failure:
+                if manual { self.alert("Couldn't Check for Updates", "Check your internet connection and try again.") }
+            case .success(let release):
+                self.availableUpdate = release
+                guard manual else { return }
+                if let release = release {
+                    let choice = self.alert("Blackout \(release.version) Is Available",
+                                            "You have \(Updater.current). Install it now? Blackout will restart.",
+                                            buttons: ["Install", "Later"])
+                    if choice == .alertFirstButtonReturn { self.installUpdate() }
+                } else {
+                    self.alert("Blackout Is Up to Date", "You have the latest version (\(Updater.current)).")
+                }
+            }
+        }
+    }
+
+    func installUpdate() {
+        guard let release = availableUpdate, !updating else { return }
+        updating = true
+        Updater.install(release) { [weak self] error in
+            self?.updating = false
+            self?.alert("Couldn't Install the Update", error.localizedDescription)
+        }
+    }
+
+    @discardableResult
+    private func alert(_ title: String, _ message: String, buttons: [String] = ["OK"]) -> NSApplication.ModalResponse {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        buttons.forEach { alert.addButton(withTitle: $0) }
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal()
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
         let header = NSMenuItem(title: "Blackout \(version)", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
+        if let update = availableUpdate {
+            let item: NSMenuItem = updating
+                ? NSMenuItem(title: "Downloading Update…", action: nil, keyEquivalent: "")
+                : ActionItem("Update to Blackout \(update.version)…") { [weak self] in self?.installUpdate() }
+            menu.addItem(item)
+        }
         menu.addItem(.separator())
 
         let toggle = ActionItem(blackout.isActive ? "End Blackout" : "Black Out Now") { [weak self] in
@@ -412,6 +581,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
         menu.addItem(ActionItem("Open at Login", checked: LoginItem.isEnabled) {
             LoginItem.set(!LoginItem.isEnabled)
+        })
+        menu.addItem(.separator())
+        menu.addItem(ActionItem("Check for Updates Automatically", checked: Settings.autoUpdate) {
+            Settings.autoUpdate.toggle()
+        })
+        menu.addItem(ActionItem(checkingForUpdate ? "Checking for Updates…" : "Check for Updates…") { [weak self] in
+            self?.checkForUpdates(manual: true)
         })
         menu.addItem(.separator())
         menu.addItem(ActionItem("Quit Blackout") { NSApp.terminate(nil) })

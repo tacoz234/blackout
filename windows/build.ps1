@@ -44,7 +44,7 @@ $numeric = ($Version -split '[-+]')[0]
 "@ | Set-Content -Encoding utf8 build\AssemblyInfo.cs
 
 & $csc /nologo /optimize+ /target:winexe /platform:anycpu /codepage:65001 /win32icon:build\Blackout.ico `
-    /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:Blackout.exe Blackout.cs build\AssemblyInfo.cs
+    /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll /out:Blackout.exe Blackout.cs build\AssemblyInfo.cs
 if ($LASTEXITCODE -ne 0) { throw "Compilation failed" }
 Write-Host "Built $PSScriptRoot\Blackout.exe ($Version)"
 
