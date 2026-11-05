@@ -553,6 +553,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             path.fill()
             NSColor.white.setStroke()
             path.stroke()
+            // The app icon's glowing line: blue, with a white-hot center.
+            func dash(from x0: CGFloat, to x1: CGFloat, _ color: NSColor) {
+                let line = NSBezierPath()
+                line.move(to: NSPoint(x: x0, y: 9))
+                line.line(to: NSPoint(x: x1, y: 9))
+                line.lineWidth = 1.75
+                line.lineCapStyle = .round
+                color.setStroke()
+                line.stroke()
+            }
+            dash(from: 5.5, to: 12.5, NSColor(srgbRed: 0.25, green: 0.55, blue: 1, alpha: 1))
+            dash(from: 8.25, to: 9.75, .white)
             return true
         }
         image.accessibilityDescription = "Blackout"
