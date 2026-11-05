@@ -602,17 +602,22 @@ sealed class Controller : ApplicationContext
         ExitThread();
     }
 
-    // White-outlined black rounded square, visible on light and dark taskbars.
+    // White-outlined black rounded square (visible on light and dark taskbars) with the app
+    // icon's glowing line through the middle: blue, with a white-hot center.
     static Icon MakeTrayIcon()
     {
         using (var bmp = new Bitmap(32, 32))
         using (var g = Graphics.FromImage(bmp))
         using (var path = RoundedRect(new RectangleF(3, 3, 26, 26), 6))
         using (var pen = new Pen(Color.White, 2.5f))
+        using (var line = new Pen(Color.FromArgb(64, 140, 255), 3f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+        using (var core = new Pen(Color.White, 3f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.FillPath(Brushes.Black, path);
             g.DrawPath(pen, path);
+            g.DrawLine(line, 9.5f, 16f, 22.5f, 16f);
+            g.DrawLine(core, 14.5f, 16f, 17.5f, 16f);
             return Icon.FromHandle(bmp.GetHicon());
         }
     }
