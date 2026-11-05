@@ -42,10 +42,17 @@ final class BlackWindow: NSWindow {
     let targetScreen: NSScreen
     var onEnd: (() -> Void)?
     var onMouseMove: (() -> Void)?
-    // Set when the app didn't take focus: NSCursor.hide() then wouldn't stick, so the cursor is
-    // swapped for a blank one only while it's over this window.
-    var blanksCursor = false
-    private static let blankCursor = NSCursor(image: NSImage(size: NSSize(width: 1, height: 1)), hotSpot: .zero)
+    // While set, the cursor is swapped for a blank one over this window. Unlike NSCursor.hide(),
+    // this doesn't depend on the app being frontmost or on hide/unhide counts, which other apps
+    // (e.g. mouse utilities) and the activation race can disturb.
+    var cursorHidden = false {
+        didSet {
+            guard cursorHidden != oldValue else { return }
+            invalidateCursorRects(for: contentView!)
+            if frame.contains(NSEvent.mouseLocation) { (cursorHidden ? Self.blankCursor : NSCursor.arrow).set() }
+        }
+    }
+    static let blankCursor = NSCursor(image: NSImage(size: NSSize(width: 1, height: 1)), hotSpot: .zero)
     private let overlay = NSTextField(labelWithString: "")
     private var flashGeneration = 0
 
@@ -60,7 +67,8 @@ final class BlackWindow: NSWindow {
         collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         setFrame(screen.frame, display: true)   // full frame, incl. menu bar/notch strip
 
-        let content = contentView!
+        let content = BlackView()
+        contentView = content
         content.wantsLayer = true
         overlay.textColor = NSColor(white: 0.6, alpha: 1)
         overlay.alphaValue = 0
@@ -90,16 +98,16 @@ final class BlackWindow: NSWindow {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        if blanksCursor { Self.blankCursor.set() }
+        if cursorHidden { Self.blankCursor.set() }
     }
 
     override func mouseMoved(with event: NSEvent) {
-        if blanksCursor { Self.blankCursor.set() }
+        if cursorHidden { Self.blankCursor.set() }
         onMouseMove?()
     }
 
     override func mouseExited(with event: NSEvent) {
-        if blanksCursor { NSCursor.arrow.set() }
+        if cursorHidden { NSCursor.arrow.set() }
     }
 
     // Shows centered text, holds it, then fades it out over 1s. Calling again restarts the hold.
@@ -119,6 +127,13 @@ final class BlackWindow: NSWindow {
     }
 }
 
+// Keeps the blank cursor applied via cursor rects whenever the window is key.
+final class BlackView: NSView {
+    override func resetCursorRects() {
+        if (window as? BlackWindow)?.cursorHidden == true { addCursorRect(bounds, cursor: BlackWindow.blankCursor) }
+    }
+}
+
 final class BlackoutController {
     private(set) var isActive = false
     private var windows: [BlackWindow] = []
@@ -127,6 +142,18 @@ final class BlackoutController {
     private var startedAt = Date()
     private var anchor = NSPoint.zero
     private var assertion: IOPMAssertionID = 0
+    private var cursorHidden = false
+    private var systemCursorHidden = false   // balances NSCursor.hide()/unhide()
+    private var cursorTimer: Timer?
+
+    init() {
+        // Activation is asynchronous, so NSCursor.hide() only sticks once the app is frontmost.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.isActive else { return }
+            self.setCursorHidden(self.cursorHidden)
+        }
+    }
 
     func toggle() { isActive ? stop() : start() }
 
@@ -136,11 +163,9 @@ final class BlackoutController {
         // Only take focus when every screen is covered, so blacking out a second display never
         // pulls focus from a fullscreen game on the main one.
         tookFocus = coveredScreens().count == NSScreen.screens.count
-        if tookFocus {
-            NSApp.activate(ignoringOtherApps: true)
-            NSCursor.hide()
-        }
+        if tookFocus { NSApp.activate(ignoringOtherApps: true) }
         buildWindows()
+        setCursorHidden(true)
         let hint = tookFocus || !Hotkey.isRegistered ? "Press escape to exit" : "Press ⌃⌥⌘B to exit"
         primaryWindow?.flash(hint, font: .systemFont(ofSize: 28, weight: .medium), hold: 2.5)
         applyKeepAwake()
@@ -154,15 +179,13 @@ final class BlackoutController {
         isActive = false
         autoExitTimer?.invalidate()
         autoExitTimer = nil
+        cursorTimer?.invalidate()
+        cursorTimer = nil
+        setCursorHidden(false)
         windows.forEach { $0.orderOut(nil) }
         windows = []
         NSApp.presentationOptions = []
-        if tookFocus {
-            NSCursor.unhide()
-            NSApp.hide(nil)   // hand focus back to the previous app
-        } else {
-            NSCursor.arrow.set()   // in case the blank cursor was showing
-        }
+        if tookFocus { NSApp.hide(nil) }   // hand focus back to the previous app
         applyKeepAwake()
     }
 
@@ -182,7 +205,7 @@ final class BlackoutController {
             let w = BlackWindow(screen: screen)
             w.onEnd = { [weak self] in DispatchQueue.main.async { self?.stop() } }
             w.onMouseMove = { [weak self, weak w] in if let w { self?.mouseMoved(in: w) } }
-            w.blanksCursor = !tookFocus
+            w.cursorHidden = cursorHidden
             if tookFocus { w.makeKeyAndOrderFront(nil) } else { w.orderFrontRegardless() }
             return w
         }
@@ -212,6 +235,17 @@ final class BlackoutController {
         }
     }
 
+    // Hidden: blank cursor over every black window, plus a real NSCursor.hide() while the app is
+    // frontmost (so it stays hidden even between windows or over the menu bar strip).
+    private func setCursorHidden(_ hidden: Bool) {
+        cursorHidden = hidden
+        windows.forEach { $0.cursorHidden = hidden }
+        let wantSystemHidden = hidden && NSApp.isActive
+        if wantSystemHidden && !systemCursorHidden { NSCursor.hide() }
+        if !wantSystemHidden && systemCursorHidden { NSCursor.unhide() }
+        systemCursorHidden = wantSystemHidden
+    }
+
     private var primaryWindow: BlackWindow? {
         let main = NSScreen.screens.first?.displayID
         return windows.first { $0.targetScreen.displayID == main } ?? windows.first
@@ -226,9 +260,22 @@ final class BlackoutController {
         guard abs(p.x - anchor.x) + abs(p.y - anchor.y) >= 6 else { return }
         anchor = p
         if Settings.exitOnInput { DispatchQueue.main.async { self.stop() }; return }
+        showCursorBriefly()
         if Settings.clockOnMove {
             let time = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
             window.flash(time, font: .systemFont(ofSize: 160, weight: .ultraLight), hold: 2)
+        }
+    }
+}
+
+extension BlackoutController {
+    // Shows the cursor while the mouse is moving, and hides it again after 2s without movement.
+    fileprivate func showCursorBriefly() {
+        setCursorHidden(false)
+        cursorTimer?.invalidate()
+        cursorTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in
+            guard let self, self.isActive else { return }
+            self.setCursorHidden(true)
         }
     }
 }
