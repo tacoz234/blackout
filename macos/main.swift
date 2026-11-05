@@ -94,7 +94,12 @@ final class BlackWindow: NSWindow {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if Settings.exitOnInput { onEnd?() }
+        if Settings.exitOnInput { onEnd?(); return }
+        // If focus went elsewhere, a click on the black screen takes it back so Escape works again.
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
+            makeKeyAndOrderFront(nil)
+        }
     }
 
     override func mouseEntered(with event: NSEvent) {
@@ -325,7 +330,8 @@ enum LoginItem {
     }
 
     // Keeps the agent pointing at this copy of the app if it was moved or reinstalled.
-    static func refresh() { if isEnabled { set(true) } }
+    // Test builds leave it alone, so running one never takes over the installed app's login item.
+    static func refresh() { if isEnabled && !Updater.isDevBuild { set(true) } }
 }
 
 // Finds newer releases on GitHub and installs them over this copy of the app.
@@ -513,6 +519,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var checkingForUpdate = false, updating = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        // Only one copy may run: two would each cover the screen, but only one can own the
+        // hotkey, so the other's blackout couldn't be ended. Hand off to the running copy instead.
+        let me = NSRunningApplication.current
+        if let other = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.blackout")
+            .first(where: { $0.processIdentifier != me.processIdentifier && !$0.isTerminated }) {
+            if !CommandLine.arguments.contains("--background"), let url = other.bundleURL {
+                NSWorkspace.shared.open(url)   // reopens the running copy, which blacks out
+            }
+            NSApp.terminate(nil)
+            return
+        }
         Settings.register()
         LoginItem.refresh()
 
@@ -614,6 +631,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @discardableResult
     private func alert(_ title: String, _ message: String, buttons: [String] = ["OK"]) -> NSApplication.ModalResponse {
+        // A dialog must never sit behind or under a blackout, where it would block the app unseen.
+        blackout.stop()
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
