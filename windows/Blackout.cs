@@ -21,7 +21,7 @@ using Timer = System.Windows.Forms.Timer;
 
 static class Settings
 {
-    public static bool KeepAwake = true, ExitOnInput = false, ClockOnMove = false, EndOnLock = true, ShownTrayTip = false, AutoUpdate = true;
+    public static bool KeepAwake = true, ExitOnInput = false, ClockOnMove = false, Clock24Hour = false, EndOnLock = true, ShownTrayTip = false, AutoUpdate = true;
     public static int TimerMinutes = 0;
     public static HashSet<string> ExcludedDisplays = new HashSet<string>();
 
@@ -41,6 +41,7 @@ static class Settings
                 case "KeepAwake": KeepAwake = v == "1"; break;
                 case "ExitOnInput": ExitOnInput = v == "1"; break;
                 case "ClockOnMove": ClockOnMove = v == "1"; break;
+                case "Clock24Hour": Clock24Hour = v == "1"; break;
                 case "EndOnLock": EndOnLock = v == "1"; break;
                 case "ShownTrayTip": ShownTrayTip = v == "1"; break;
                 case "AutoUpdate": AutoUpdate = v == "1"; break;
@@ -59,6 +60,7 @@ static class Settings
             "KeepAwake=" + B(KeepAwake),
             "ExitOnInput=" + B(ExitOnInput),
             "ClockOnMove=" + B(ClockOnMove),
+            "Clock24Hour=" + B(Clock24Hour),
             "EndOnLock=" + B(EndOnLock),
             "ShownTrayTip=" + B(ShownTrayTip),
             "AutoUpdate=" + B(AutoUpdate),
@@ -423,7 +425,7 @@ sealed class Controller : ApplicationContext
         if (Math.Abs(p.X - anchor.X) + Math.Abs(p.Y - anchor.Y) < 6) return;
         anchor = p;
         if (Settings.ExitOnInput) { RequestStop(); return; }
-        if (Settings.ClockOnMove) form.Flash(DateTime.Now.ToString("t"), "Segoe UI Light", 160, 2.0);
+        if (Settings.ClockOnMove) form.Flash(DateTime.Now.ToString(Settings.Clock24Hour ? "HH:mm" : "h:mm tt", System.Globalization.CultureInfo.InvariantCulture), "Segoe UI Light", 160, 2.0);
     }
 
     void CheckForUpdates(bool manual)
@@ -557,6 +559,7 @@ sealed class Controller : ApplicationContext
         items.Add(Option("Keep display awake", Settings.KeepAwake, v => { Settings.KeepAwake = v; ApplyKeepAwake(); }));
         items.Add(Option("Exit on mouse move or any key", Settings.ExitOnInput, v => Settings.ExitOnInput = v));
         items.Add(Option("Show clock on mouse move", Settings.ClockOnMove, v => Settings.ClockOnMove = v));
+        items.Add(Option("Use 24-hour clock", Settings.Clock24Hour, v => Settings.Clock24Hour = v));
         items.Add(Option("End blackout when PC locks", Settings.EndOnLock, v => Settings.EndOnLock = v));
         items.Add(new ToolStripMenuItem("Start with Windows", null, (s, e) =>
         {

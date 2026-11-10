@@ -10,7 +10,7 @@ enum Settings {
     private static let d = UserDefaults.standard
 
     static func register() {
-        d.register(defaults: ["keepAwake": true, "exitOnInput": false, "clockOnMove": false,
+        d.register(defaults: ["keepAwake": true, "exitOnInput": false, "clockOnMove": false, "clock24Hour": false,
                               "endOnLock": true, "timerMinutes": 0, "excludedDisplays": [String](),
                               "autoUpdate": true])
     }
@@ -18,6 +18,7 @@ enum Settings {
     static var keepAwake: Bool { get { d.bool(forKey: "keepAwake") } set { d.set(newValue, forKey: "keepAwake") } }
     static var exitOnInput: Bool { get { d.bool(forKey: "exitOnInput") } set { d.set(newValue, forKey: "exitOnInput") } }
     static var clockOnMove: Bool { get { d.bool(forKey: "clockOnMove") } set { d.set(newValue, forKey: "clockOnMove") } }
+    static var clock24Hour: Bool { get { d.bool(forKey: "clock24Hour") } set { d.set(newValue, forKey: "clock24Hour") } }
     static var endOnLock: Bool { get { d.bool(forKey: "endOnLock") } set { d.set(newValue, forKey: "endOnLock") } }
     static var autoUpdate: Bool { get { d.bool(forKey: "autoUpdate") } set { d.set(newValue, forKey: "autoUpdate") } }
     static var timerMinutes: Int { get { d.integer(forKey: "timerMinutes") } set { d.set(newValue, forKey: "timerMinutes") } }
@@ -267,7 +268,10 @@ final class BlackoutController {
         if Settings.exitOnInput { DispatchQueue.main.async { self.stop() }; return }
         showCursorBriefly()
         if Settings.clockOnMove {
-            let time = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = Settings.clock24Hour ? "HH:mm" : "h:mm a"
+            let time = formatter.string(from: Date())
             window.flash(time, font: .systemFont(ofSize: 160, weight: .ultraLight), hold: 2)
         }
     }
@@ -705,6 +709,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
         menu.addItem(ActionItem("Show Clock on Mouse Move", isOn: { Settings.clockOnMove }, stayOpen: true) {
             Settings.clockOnMove.toggle()
+        })
+        menu.addItem(ActionItem("Use 24-Hour Clock", isOn: { Settings.clock24Hour }, stayOpen: true) {
+            Settings.clock24Hour.toggle()
         })
         menu.addItem(ActionItem("End Blackout When Mac Locks", isOn: { Settings.endOnLock }, stayOpen: true) {
             Settings.endOnLock.toggle()

@@ -5,9 +5,9 @@ It covers the entire display (menu bar/notch on macOS, taskbar on Windows), hide
 and shows a brief "Press escape to exit" hint that fades away.
 
 Opening Blackout blacks out immediately. Afterwards it stays in the menu bar (macOS) / system tray
-(Windows) so you can black out again with a global hotkey.
+(Windows and Linux) so you can black out again with a global hotkey. See [Linux setup](#linux) below.
 
-| | macOS | Windows |
+| | macOS | Windows / Linux |
 |---|---|---|
 | Black out / end | **⌃⌥⌘B** | **Ctrl+Alt+B** (or left-click the tray icon) |
 | End blackout | Escape or ⌘Q | Escape or Alt+F4 |
@@ -16,6 +16,80 @@ Opening Blackout blacks out immediately. Afterwards it stays in the menu bar (ma
 **Gaming on another display:** if only some displays are blacked out, Blackout never takes focus,
 so a fullscreen game on the uncovered display keeps running. End it with the hotkey, or click the black screen and press Escape.
 Blackout uses essentially no CPU, whether idle in the tray/menu bar or blacked out: it doesn't poll, it just waits for events.
+
+## Linux
+
+The Linux app stays in the system tray after blackout ends. Closing its options
+window hides it; **Quit Blackout** explicitly exits. **Ctrl+Alt+B** or left-clicking
+the tray toggles blackout; right-click opens the full options menu. Escape ends
+blackout. When only some monitors are covered, click a black screen before pressing
+Escape, or use the global shortcut without leaving your game.
+
+All options below are implemented on Linux, including the fading clock, automatic
+updates, end-on-lock, and start-at-login. Settings are stored in
+`$XDG_CONFIG_HOME/blackout/settings.json` (default `~/.config/blackout/settings.json`).
+
+Install the runtime dependencies:
+
+```sh
+# Ubuntu / Debian
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-dbusmenu-gtk3-0.4 gir1.2-gtklayershell-0.1
+# Fedora
+sudo dnf install python3-gobject gtk3 libdbusmenu-gtk3 gtk-layer-shell
+# Arch
+sudo pacman -S python-gobject gtk3 libdbusmenu-gtk3 gtk-layer-shell
+```
+
+Install for your user and enable background startup at login:
+
+```sh
+./linux/build.sh --install --autostart
+~/.local/bin/blackout --background
+```
+
+The installer adds an applications-menu entry. Launch normally to black out immediately;
+`--background` starts silently in the tray. `--preferences` opens the controls,
+`--toggle` toggles blackout, `--stop` ends it, `--status` reports integration status,
+and `--quit` exits. All commands reach the same running instance. The tray's **Start at
+login** checkbox controls an XDG autostart entry. The app waits for events rather than
+polling for mouse movement, keyboard input, or lock state.
+
+KDE uses its native global shortcut service. X11 sessions register Ctrl+Alt+B directly.
+Other Wayland desktops use the global-shortcut portal, which may ask permission or
+require configuring the binding. If registration is unavailable, bind
+`~/.local/bin/blackout --toggle` in your desktop keyboard settings. Shortcut conflicts
+are reported in Options. A desktop that supports StatusNotifierItem is required for
+the tray; on GNOME, enable an AppIndicator/StatusNotifier extension, or open the
+controls with `blackout --preferences`.
+
+On KDE and compatible Wayland compositors, layer-shell places the black surface over
+the entire chosen monitor without taking focus from a game on another monitor.
+Clicking that surface explicitly gives it keyboard input. Compositors without
+layer-shell use Xwayland when available. Keep-awake, lock reporting, tray behavior,
+and shortcut permissions still depend on desktop services; identical behavior on
+every Linux desktop cannot be guaranteed. Native KDE Wayland coverage, sleep-inhibitor
+release, tray activation, shortcut dispatch, and fullscreen focus preservation have
+been tested on a two-monitor setup, including a rotated display with fractional scaling.
+
+Release archives named `Blackout-<version>-linux.tar.gz` contain the same source files;
+extract one and run `./linux/build.sh --install`. Package with
+`VERSION=1.2.0 ./linux/build.sh --package`. Linux updates require a per-user installation,
+verify GitHub's SHA-256 digest, replace the app with rollback on failure, and restart
+in the background. Development builds only check for updates when asked.
+
+To uninstall, disable **Start at login**, run `blackout --quit`, and remove
+`~/.local/bin/blackout`, `~/.local/share/blackout`, and
+`~/.local/share/applications/io.github.tacoz234.Blackout.desktop` (adjust data paths if
+you set `XDG_DATA_HOME`). Remove the autostart file
+`~/.config/autostart/io.github.tacoz234.Blackout.desktop` if still present.
+
+Linux regression tests (GTK, Xvfb, D-Bus, xdotool, desktop-file-utils required):
+
+```sh
+dbus-run-session -- xvfb-run -a /usr/bin/python3 -m unittest discover -s linux -p 'test_[bip]*.py' -v
+# Optional live KDE test: briefly covers your displays and uses a fullscreen focus probe.
+/usr/bin/python3 linux/test_kde.py
+```
 
 ## Options
 
@@ -26,6 +100,7 @@ All saved between launches:
 - **Keep display awake** *(on by default)* — prevents display/system sleep while blacked out.
 - **Exit on mouse move or any key** — screensaver-style.
 - **Show clock on mouse move** — briefly shows the time on the screen under the cursor, then fades back to black.
+- **Use 24-hour clock** — choose `13:05` when enabled, or `1:05 PM` when disabled (the default), on all platforms.
 - **End blackout when the computer locks** *(on by default)*.
 - **Start at login** — launches into the tray/menu bar at sign-in without blacking out.
 - **Check for updates automatically** *(on by default)* — see below.
@@ -73,7 +148,7 @@ powershell -ExecutionPolicy Bypass -File windows\build.ps1 -Version 1.2.0 -Insta
 
 ## Releases
 
-GitHub Actions builds both platforms on every push and PR. To publish a release, push a version tag:
+GitHub Actions builds all three platforms on every push and PR. To publish a release, push a version tag:
 
 ```sh
 git tag v1.0.0 && git push origin v1.0.0
