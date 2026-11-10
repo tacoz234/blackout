@@ -34,9 +34,11 @@ class Packaging(unittest.TestCase):
 
     def test_release_has_all_runtime_files_and_stamped_version(self):
         version = '7.8.9-test'
+        archive_path = ROOT / f'dist/Blackout-{version}-linux.tar.gz'
+        self.addCleanup(archive_path.unlink, missing_ok=True)
         subprocess.run([ROOT / 'linux/build.sh', '--package'], env=dict(os.environ, VERSION=version),
                        check=True, capture_output=True)
-        with tarfile.open(ROOT / f'dist/Blackout-{version}-linux.tar.gz') as archive:
+        with tarfile.open(archive_path) as archive:
             names = archive.getnames()
             self.assertTrue(all('linux/' + filename in names for filename in updater.FILES))
             self.assertIn('linux/build.sh', names)
